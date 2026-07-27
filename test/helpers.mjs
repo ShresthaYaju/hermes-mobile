@@ -98,21 +98,22 @@ export async function startFakeHermes() {
 
 /** Raw request helper -- undici/fetch rejects some of the malformed paths we test. */
 export function rawGet(port, path, headers = {}) {
+  return rawRequest(port, 'GET', path, headers);
+}
+
+export function rawRequest(port, method, path, headers = {}) {
   return new Promise((resolve, reject) => {
-    const request = http.request(
-      { host: '127.0.0.1', port, path, method: 'GET', headers },
-      (response) => {
-        const chunks = [];
-        response.on('data', (chunk) => chunks.push(chunk));
-        response.on('end', () =>
-          resolve({
-            status: response.statusCode,
-            headers: response.headers,
-            body: Buffer.concat(chunks).toString('utf8'),
-          }),
-        );
-      },
-    );
+    const request = http.request({ host: '127.0.0.1', port, path, method, headers }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () =>
+        resolve({
+          status: response.statusCode,
+          headers: response.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        }),
+      );
+    });
     request.on('error', reject);
     request.end();
   });

@@ -13,6 +13,40 @@ const hermesOrigin = process.env.HERMES_ORIGIN ?? 'http://127.0.0.1:9119';
 const hermesSessionToken = process.env.HERMES_DASHBOARD_SESSION_TOKEN ?? '';
 const publicDir = join(process.cwd(), 'public');
 
+// Hermes's backend serves its entire dashboard API on the loopback port, which
+// includes secrets (/api/env/reveal), filesystem access (/api/files), and
+// gateway lifecycle control (/api/ops). Anyone on the tailnet reaches this
+// proxy unauthenticated, so rather than forwarding /api/* wholesale we allow
+// only the read paths the mobile UI needs. Everything else is refused here and
+// never reaches Hermes.
+//
+// Writes (cron pause/trigger, session rename) are deliberately not enabled yet
+// -- they arrive with the write-actions work, together with the UI that makes
+// their blast radius visible.
+const restReadPrefixes = [
+  '/api/status',
+  '/api/system/stats',
+  '/api/sessions',
+  '/api/profiles',
+  '/api/cron/jobs',
+  '/api/cron/blueprints',
+  '/api/cron/delivery-targets',
+  '/api/analytics/',
+  '/api/logs',
+  '/api/model/info',
+];
+
+// The JSON-RPC gateway is a separate, already-working path with its own
+// credential handling in the upgrade handler.
+const websocketPath = '/api/ws';
+
+function isAllowedRestRequest(method, pathname) {
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  return restReadPrefixes.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix.replace(/\/$/, '')}/`),
+  );
+}
+
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -52,6 +86,18 @@ proxy.on('error', (error, request, target) => {
     return;
   }
   target.destroy();
+});
+
+// Hermes authenticates REST calls with a header, the same shared loopback
+// credential the WebSocket upgrade uses. Add it on the internal hop only, so
+// the browser never receives it -- mirroring what proxyReqWs already does.
+proxy.on('proxyReq', (proxyRequest) => {
+  if (hermesSessionToken) {
+    proxyRequest.setHeader('X-Hermes-Session-Token', hermesSessionToken);
+  }
+  proxyRequest.removeHeader('x-forwarded-for');
+  proxyRequest.removeHeader('x-forwarded-host');
+  proxyRequest.removeHeader('x-forwarded-proto');
 });
 
 // The upstream service is loopback-only and validates Host and Origin on every
@@ -110,6 +156,7 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (url.pathname === '/healthz') {
+    securityHeaders(response);
     response.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
@@ -118,6 +165,13 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (url.pathname.startsWith('/api/')) {
+    if (url.pathname === websocketPath || !isAllowedRestRequest(request.method, url.pathname)) {
+      securityHeaders(response);
+      response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify({ error: 'Not exposed by hermes-mobile.' }));
+      return;
+    }
+    securityHeaders(response);
     proxy.web(request, response);
     return;
   }
