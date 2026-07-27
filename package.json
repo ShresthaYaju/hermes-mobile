@@ -6,8 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test",
-    "check": "node --check server.mjs && node --check public/app.js"
+    "test": "node --test 'test/*.test.mjs'",
+    "format": "prettier --write 'public/*.{js,css}' server.mjs 'test/*.mjs'",
+    "check": "node --check server.mjs && node --check public/app.js && prettier --check 'public/*.{js,css}' server.mjs 'test/*.mjs'"
   },
   "dependencies": {
     "http-proxy": "^1.18.1"

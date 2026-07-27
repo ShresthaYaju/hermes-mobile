@@ -32,16 +32,26 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
-proxy.on('error', (error, request, response) => {
+// http-proxy reuses this handler for both proxy.web() and proxy.ws(). On a
+// WebSocket failure the third argument is a net.Socket, which has no
+// writeHead/headersSent -- calling them there throws and takes the process
+// down, which is exactly what happens when a phone's reconnect loop hits a
+// restarting backend. Branch on the shape rather than assuming a response.
+proxy.on('error', (error, request, target) => {
   console.error('Hermes proxy error:', error.message);
-  if (response && !response.headersSent) {
-    response.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
-    response.end(
-      JSON.stringify({
-        error: 'Hermes backend is unavailable. Check hermes-mobile-backend.service.',
-      }),
-    );
+  if (!target) return;
+  if (typeof target.writeHead === 'function') {
+    if (!target.headersSent) {
+      target.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
+      target.end(
+        JSON.stringify({
+          error: 'Hermes backend is unavailable. Check hermes-mobile-backend.service.',
+        }),
+      );
+    }
+    return;
   }
+  target.destroy();
 });
 
 // The upstream service is loopback-only and validates Host and Origin on every
@@ -71,8 +81,34 @@ function publicPath(urlPath) {
   return resolved.startsWith(`${publicDir}/`) ? resolved : null;
 }
 
+// A malformed percent-escape (e.g. GET /%) makes decodeURIComponent throw a
+// URIError. Unhandled, that ends the process -- an unauthenticated remote kill
+// switch for anyone who can reach the port.
+function decodePath(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+}
+
+// Request URLs arrive unvalidated; a garbage target or Host header makes the
+// URL constructor throw inside an event handler, which is fatal.
+function parseRequestUrl(request) {
+  try {
+    return new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+  } catch {
+    return null;
+  }
+}
+
 const server = http.createServer((request, response) => {
-  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+  const url = parseRequestUrl(request);
+  if (!url) {
+    response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    response.end('Bad request');
+    return;
+  }
   if (url.pathname === '/healthz') {
     response.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
@@ -86,7 +122,14 @@ const server = http.createServer((request, response) => {
     return;
   }
 
-  const filePath = publicPath(decodeURIComponent(url.pathname));
+  const decoded = decodePath(url.pathname);
+  if (decoded === null) {
+    response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    response.end('Bad request');
+    return;
+  }
+
+  const filePath = publicPath(decoded);
   if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
     response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Not found');
@@ -102,8 +145,11 @@ const server = http.createServer((request, response) => {
 });
 
 server.on('upgrade', (request, socket, head) => {
-  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
-  if (!url.pathname.startsWith('/api/') || !hermesSessionToken) {
+  const url = parseRequestUrl(request);
+  if (!url || !url.pathname.startsWith('/api/') || !hermesSessionToken) {
+    if (!hermesSessionToken) {
+      console.error('Refusing WebSocket upgrade: HERMES_DASHBOARD_SESSION_TOKEN is not set.');
+    }
     socket.destroy();
     return;
   }
@@ -112,7 +158,11 @@ server.on('upgrade', (request, socket, head) => {
   proxy.ws(request, socket, head);
 });
 
+// Report the address actually bound, not the requested one, so PORT=0 works
+// (the tests rely on this to run the real server on an ephemeral port).
 server.listen(port, host, () => {
-  console.log(`Hermes mobile PWA listening on http://${host}:${port}`);
+  const address = server.address();
+  const boundPort = typeof address === 'object' && address ? address.port : port;
+  console.log(`Hermes mobile PWA listening on http://${host}:${boundPort}`);
   console.log(`Proxying /api/* to ${hermesOrigin}`);
 });
