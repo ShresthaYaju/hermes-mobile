@@ -1,27 +1,309 @@
 const $ = (selector) => document.querySelector(selector);
-const elements = { messages: $('#messages'), welcome: $('#welcome'), prompt: $('#prompt'), composer: $('#composer'), send: $('#send'), stop: $('#stop'), connection: $('#connection'), activity: $('#activity'), approval: $('#approval'), newChat: $('#new-chat') };
-let socket; let sessionId; let requestCounter = 0; let pending = new Map(); let isRunning = false; let activeAssistant; let activeText = '';
+const elements = {
+  messages: $('#messages'),
+  welcome: $('#welcome'),
+  prompt: $('#prompt'),
+  composer: $('#composer'),
+  send: $('#send'),
+  stop: $('#stop'),
+  connection: $('#connection'),
+  activity: $('#activity'),
+  approval: $('#approval'),
+  newChat: $('#new-chat'),
+};
+let socket;
+let sessionId;
+let requestCounter = 0;
+let pending = new Map();
+let isRunning = false;
+let activeAssistant;
+let activeText = '';
 const transcriptKey = 'hermes-mobile-transcript-v1';
 
-function escapeHTML(value) { return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;'); }
-function renderMarkdown(text) { const blocks = escapeHTML(text).split(/```([\s\S]*?)```/g); return blocks.map((block, i) => i % 2 ? `<pre><code>${block.trim()}</code></pre>` : block.split(/\n{2,}/).filter(Boolean).map(p => `<p>${p.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>')}</p>`).join('')).join(''); }
-function scrollDown() { requestAnimationFrame(() => elements.messages.scrollTo({ top: elements.messages.scrollHeight, behavior: 'smooth' })); }
-function saveTranscript() { const items = [...elements.messages.querySelectorAll('.message')].map(node => ({ role: node.classList.contains('message--user') ? 'user' : 'assistant', text: node.dataset.text || '' })).filter(x => x.text); localStorage.setItem(transcriptKey, JSON.stringify(items.slice(-60))); }
-function message(role, text = '') { elements.welcome?.remove(); const row = document.createElement('article'); row.className = `message message--${role}`; row.dataset.text = text; const bubble = document.createElement('div'); bubble.className = 'bubble'; row.append(bubble); elements.messages.append(row); updateMessage(row, text); scrollDown(); return row; }
-function updateMessage(row, text) { row.dataset.text = text; row.querySelector('.bubble').innerHTML = roleFrom(row) === 'assistant' ? renderMarkdown(text || '<span class="typing">•••</span>') : escapeHTML(text); scrollDown(); }
-function roleFrom(row) { return row.classList.contains('message--assistant') ? 'assistant' : 'user'; }
-function systemLine(text) { const line = document.createElement('div'); line.className = 'status-line'; line.textContent = text; elements.messages.append(line); scrollDown(); }
-function setConnection(state, label) { elements.connection.className = `connection connection--${state}`; elements.connection.textContent = label; }
-function setRunning(value) { isRunning = value; elements.send.disabled = value || !elements.prompt.value.trim(); elements.stop.hidden = !value; }
-function resize() { elements.prompt.style.height = 'auto'; elements.prompt.style.height = `${Math.min(elements.prompt.scrollHeight, 180)}px`; }
-function activity(text) { if (!text) { elements.activity.hidden = true; return; } elements.activity.hidden = false; elements.activity.innerHTML = `<strong>Hermes is working</strong> · ${escapeHTML(text)}`; }
-function rpc(method, params = {}) { if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Not connected to Hermes')); const id = `m${++requestCounter}`; socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); return new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error(`${method} timed out`)); } }, 30000); }); }
-function createSession() { return rpc('session.create', { source: 'web-pwa', close_on_disconnect: false }).then(result => { sessionId = result.session_id; return result; }); }
-function restoreTranscript() { try { const entries = JSON.parse(localStorage.getItem(transcriptKey) || '[]'); entries.forEach(({ role, text }) => message(role, text)); } catch { localStorage.removeItem(transcriptKey); } }
-function newChat() { if (isRunning && !confirm('Stop the current run and start a new conversation?')) return; localStorage.removeItem(transcriptKey); elements.messages.innerHTML = ''; elements.messages.append(elements.welcome || document.createElement('div')); elements.welcome = null; activeAssistant = undefined; activeText = ''; activity(''); createSession().then(() => systemLine('New conversation')).catch(showError); }
-function showError(error) { activity(''); setRunning(false); systemLine(`Connection error: ${error.message || error}`); }
-function submit(text) { text = text.trim(); if (!text || isRunning) return; message('user', text); saveTranscript(); elements.prompt.value = ''; resize(); setRunning(true); activity('starting a turn'); activeText = ''; activeAssistant = message('assistant'); rpc('prompt.submit', { session_id: sessionId, text }).catch(showError); }
-function showApproval(payload) { const choices = Array.isArray(payload.choices) ? payload.choices : ['deny']; elements.approval.hidden = false; elements.approval.innerHTML = `<h2>Approval required</h2><p>${escapeHTML(payload.message || payload.command || 'Hermes needs your approval to continue.')}</p><div class="approval-actions">${choices.map(choice => `<button class="${choice === 'deny' ? 'deny' : ''}" data-choice="${escapeHTML(choice)}">${escapeHTML(choice)}</button>`).join('')}</div>`; elements.approval.querySelectorAll('button').forEach(button => button.addEventListener('click', () => { rpc('approval.respond', { session_id: sessionId, choice: button.dataset.choice }).catch(showError); elements.approval.hidden = true; })); }
-function handleEvent(params) { const { type, session_id, payload = {} } = params; if (session_id && sessionId && session_id !== sessionId) return; if (type === 'gateway.ready') return; if (type === 'message.start') { activeText = ''; if (!activeAssistant) activeAssistant = message('assistant'); setRunning(true); activity('thinking'); return; } if (type === 'message.delta') { activeText += payload.text || ''; if (!activeAssistant) activeAssistant = message('assistant'); updateMessage(activeAssistant, activeText); return; } if (type === 'message.interim') { if (payload.text) { activeText = payload.text; if (!activeAssistant) activeAssistant = message('assistant'); updateMessage(activeAssistant, activeText); } return; } if (type === 'message.complete') { const finalText = payload.text || activeText || '(No visible response)'; if (!activeAssistant) activeAssistant = message('assistant'); updateMessage(activeAssistant, finalText); activeAssistant = undefined; activeText = ''; activity(''); setRunning(false); saveTranscript(); return; } if (type === 'tool.start') { activity(`using ${payload.name || payload.tool || 'a tool'}`); return; } if (type === 'tool.complete') { activity(payload.name ? `finished ${payload.name}` : 'checking results'); return; } if (type === 'status.update') { activity(payload.text || 'working'); return; } if (type === 'approval.request') { showApproval(payload); return; } if (type === 'clarify.request') { systemLine(`Hermes needs input: ${payload.question || payload.message || 'please respond in the chat.'}`); return; } if (type === 'error') { showError(new Error(payload.message || 'Hermes returned an error')); } }
-function connect() { setConnection('idle', 'connecting'); const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'; socket = new WebSocket(`${protocol}//${location.host}/api/ws`); socket.addEventListener('open', () => { setConnection('live', 'live'); createSession().catch(showError); }); socket.addEventListener('message', ({ data }) => { let frame; try { frame = JSON.parse(data); } catch { return; } if (frame.id && pending.has(frame.id)) { const waiter = pending.get(frame.id); pending.delete(frame.id); frame.error ? waiter.reject(new Error(frame.error.message)) : waiter.resolve(frame.result); return; } if (frame.method === 'event') handleEvent(frame.params || {}); }); socket.addEventListener('close', () => { setConnection('error', 'offline'); for (const { reject } of pending.values()) reject(new Error('Connection closed')); pending.clear(); setRunning(false); setTimeout(connect, 2500); }); socket.addEventListener('error', () => setConnection('error', 'offline')); }
-elements.composer.addEventListener('submit', (event) => { event.preventDefault(); submit(elements.prompt.value); }); elements.prompt.addEventListener('input', () => { resize(); setRunning(isRunning); }); elements.prompt.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); elements.composer.requestSubmit(); } }); elements.stop.addEventListener('click', () => rpc('session.interrupt', { session_id: sessionId }).catch(showError)); elements.newChat.addEventListener('click', newChat); document.querySelectorAll('[data-prompt]').forEach(button => button.addEventListener('click', () => { elements.prompt.value = button.dataset.prompt; resize(); elements.prompt.focus(); })); if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js').catch(() => {}); restoreTranscript(); resize(); connect();
+function escapeHTML(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+function renderMarkdown(text) {
+  const blocks = escapeHTML(text).split(/```([\s\S]*?)```/g);
+  return blocks
+    .map((block, i) =>
+      i % 2
+        ? `<pre><code>${block.trim()}</code></pre>`
+        : block
+            .split(/\n{2,}/)
+            .filter(Boolean)
+            .map(
+              (p) => `<p>${p.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n/g, '<br>')}</p>`,
+            )
+            .join(''),
+    )
+    .join('');
+}
+function scrollDown() {
+  requestAnimationFrame(() =>
+    elements.messages.scrollTo({ top: elements.messages.scrollHeight, behavior: 'smooth' }),
+  );
+}
+function saveTranscript() {
+  const items = [...elements.messages.querySelectorAll('.message')]
+    .map((node) => ({
+      role: node.classList.contains('message--user') ? 'user' : 'assistant',
+      text: node.dataset.text || '',
+    }))
+    .filter((x) => x.text);
+  localStorage.setItem(transcriptKey, JSON.stringify(items.slice(-60)));
+}
+function message(role, text = '') {
+  elements.welcome?.remove();
+  const row = document.createElement('article');
+  row.className = `message message--${role}`;
+  row.dataset.text = text;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  row.append(bubble);
+  elements.messages.append(row);
+  updateMessage(row, text);
+  scrollDown();
+  return row;
+}
+function updateMessage(row, text) {
+  row.dataset.text = text;
+  row.querySelector('.bubble').innerHTML =
+    roleFrom(row) === 'assistant'
+      ? renderMarkdown(text || '<span class="typing">•••</span>')
+      : escapeHTML(text);
+  scrollDown();
+}
+function roleFrom(row) {
+  return row.classList.contains('message--assistant') ? 'assistant' : 'user';
+}
+function systemLine(text) {
+  const line = document.createElement('div');
+  line.className = 'status-line';
+  line.textContent = text;
+  elements.messages.append(line);
+  scrollDown();
+}
+function setConnection(state, label) {
+  elements.connection.className = `connection connection--${state}`;
+  elements.connection.textContent = label;
+}
+function setRunning(value) {
+  isRunning = value;
+  elements.send.disabled = value || !elements.prompt.value.trim();
+  elements.stop.hidden = !value;
+}
+function resize() {
+  elements.prompt.style.height = 'auto';
+  elements.prompt.style.height = `${Math.min(elements.prompt.scrollHeight, 180)}px`;
+}
+function activity(text) {
+  if (!text) {
+    elements.activity.hidden = true;
+    return;
+  }
+  elements.activity.hidden = false;
+  elements.activity.innerHTML = `<strong>Hermes is working</strong> · ${escapeHTML(text)}`;
+}
+function rpc(method, params = {}) {
+  if (!socket || socket.readyState !== WebSocket.OPEN)
+    return Promise.reject(new Error('Not connected to Hermes'));
+  const id = `m${++requestCounter}`;
+  socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        reject(new Error(`${method} timed out`));
+      }
+    }, 30000);
+  });
+}
+function createSession() {
+  return rpc('session.create', { source: 'web-pwa', close_on_disconnect: false }).then((result) => {
+    sessionId = result.session_id;
+    return result;
+  });
+}
+function restoreTranscript() {
+  try {
+    const entries = JSON.parse(localStorage.getItem(transcriptKey) || '[]');
+    entries.forEach(({ role, text }) => message(role, text));
+  } catch {
+    localStorage.removeItem(transcriptKey);
+  }
+}
+function newChat() {
+  if (isRunning && !confirm('Stop the current run and start a new conversation?')) return;
+  localStorage.removeItem(transcriptKey);
+  elements.messages.innerHTML = '';
+  elements.messages.append(elements.welcome || document.createElement('div'));
+  elements.welcome = null;
+  activeAssistant = undefined;
+  activeText = '';
+  activity('');
+  createSession()
+    .then(() => systemLine('New conversation'))
+    .catch(showError);
+}
+function showError(error) {
+  activity('');
+  setRunning(false);
+  systemLine(`Connection error: ${error.message || error}`);
+}
+function submit(text) {
+  text = text.trim();
+  if (!text || isRunning) return;
+  message('user', text);
+  saveTranscript();
+  elements.prompt.value = '';
+  resize();
+  setRunning(true);
+  activity('starting a turn');
+  activeText = '';
+  activeAssistant = message('assistant');
+  rpc('prompt.submit', { session_id: sessionId, text }).catch(showError);
+}
+function showApproval(payload) {
+  const choices = Array.isArray(payload.choices) ? payload.choices : ['deny'];
+  elements.approval.hidden = false;
+  elements.approval.innerHTML = `<h2>Approval required</h2><p>${escapeHTML(payload.message || payload.command || 'Hermes needs your approval to continue.')}</p><div class="approval-actions">${choices.map((choice) => `<button class="${choice === 'deny' ? 'deny' : ''}" data-choice="${escapeHTML(choice)}">${escapeHTML(choice)}</button>`).join('')}</div>`;
+  elements.approval.querySelectorAll('button').forEach((button) =>
+    button.addEventListener('click', () => {
+      rpc('approval.respond', { session_id: sessionId, choice: button.dataset.choice }).catch(
+        showError,
+      );
+      elements.approval.hidden = true;
+    }),
+  );
+}
+function handleEvent(params) {
+  const { type, session_id, payload = {} } = params;
+  if (session_id && sessionId && session_id !== sessionId) return;
+  if (type === 'gateway.ready') return;
+  if (type === 'message.start') {
+    activeText = '';
+    if (!activeAssistant) activeAssistant = message('assistant');
+    setRunning(true);
+    activity('thinking');
+    return;
+  }
+  if (type === 'message.delta') {
+    activeText += payload.text || '';
+    if (!activeAssistant) activeAssistant = message('assistant');
+    updateMessage(activeAssistant, activeText);
+    return;
+  }
+  if (type === 'message.interim') {
+    if (payload.text) {
+      activeText = payload.text;
+      if (!activeAssistant) activeAssistant = message('assistant');
+      updateMessage(activeAssistant, activeText);
+    }
+    return;
+  }
+  if (type === 'message.complete') {
+    const finalText = payload.text || activeText || '(No visible response)';
+    if (!activeAssistant) activeAssistant = message('assistant');
+    updateMessage(activeAssistant, finalText);
+    activeAssistant = undefined;
+    activeText = '';
+    activity('');
+    setRunning(false);
+    saveTranscript();
+    return;
+  }
+  if (type === 'tool.start') {
+    activity(`using ${payload.name || payload.tool || 'a tool'}`);
+    return;
+  }
+  if (type === 'tool.complete') {
+    activity(payload.name ? `finished ${payload.name}` : 'checking results');
+    return;
+  }
+  if (type === 'status.update') {
+    activity(payload.text || 'working');
+    return;
+  }
+  if (type === 'approval.request') {
+    showApproval(payload);
+    return;
+  }
+  if (type === 'clarify.request') {
+    systemLine(
+      `Hermes needs input: ${payload.question || payload.message || 'please respond in the chat.'}`,
+    );
+    return;
+  }
+  if (type === 'error') {
+    showError(new Error(payload.message || 'Hermes returned an error'));
+  }
+}
+function connect() {
+  setConnection('idle', 'connecting');
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${protocol}//${location.host}/api/ws`);
+  socket.addEventListener('open', () => {
+    setConnection('live', 'live');
+    createSession().catch(showError);
+  });
+  socket.addEventListener('message', ({ data }) => {
+    let frame;
+    try {
+      frame = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (frame.id && pending.has(frame.id)) {
+      const waiter = pending.get(frame.id);
+      pending.delete(frame.id);
+      frame.error ? waiter.reject(new Error(frame.error.message)) : waiter.resolve(frame.result);
+      return;
+    }
+    if (frame.method === 'event') handleEvent(frame.params || {});
+  });
+  socket.addEventListener('close', () => {
+    setConnection('error', 'offline');
+    for (const { reject } of pending.values()) reject(new Error('Connection closed'));
+    pending.clear();
+    setRunning(false);
+    setTimeout(connect, 2500);
+  });
+  socket.addEventListener('error', () => setConnection('error', 'offline'));
+}
+elements.composer.addEventListener('submit', (event) => {
+  event.preventDefault();
+  submit(elements.prompt.value);
+});
+elements.prompt.addEventListener('input', () => {
+  resize();
+  setRunning(isRunning);
+});
+elements.prompt.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    elements.composer.requestSubmit();
+  }
+});
+elements.stop.addEventListener('click', () =>
+  rpc('session.interrupt', { session_id: sessionId }).catch(showError),
+);
+elements.newChat.addEventListener('click', newChat);
+document.querySelectorAll('[data-prompt]').forEach((button) =>
+  button.addEventListener('click', () => {
+    elements.prompt.value = button.dataset.prompt;
+    resize();
+    elements.prompt.focus();
+  }),
+);
+if ('serviceWorker' in navigator)
+  navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+restoreTranscript();
+resize();
+connect();
