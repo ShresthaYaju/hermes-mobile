@@ -1,0 +1,10 @@
+{
+  "name": "Hermes Mobile",
+  "short_name": "Hermes",
+  "description": "Private mobile control for Hermes Agent over Tailscale.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#171512",
+  "theme_color": "#171512",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

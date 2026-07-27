@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes headless JSON-RPC backend for Hermes Mobile PWA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-mobile-pwa.env
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/hermes serve --host 127.0.0.1 --port 9119
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
