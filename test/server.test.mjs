@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startProxy, startFakeHermes, rawGet, rawUpgrade } from './helpers.mjs';
+import { startProxy, startFakeHermes, rawGet, rawRequest, rawUpgrade } from './helpers.mjs';
 
 test('serves the app shell with security headers', async (t) => {
   const proxy = await startProxy();
@@ -94,7 +94,7 @@ test('unknown paths 404 without reaching the proxy', async (t) => {
   assert.equal(hermes.requests.length, 0);
 });
 
-test('/api/* is forwarded upstream', async (t) => {
+test('allowlisted read endpoints are forwarded upstream', async (t) => {
   const hermes = await startFakeHermes();
   const proxy = await startProxy({ hermesOrigin: hermes.origin });
   t.after(async () => {
@@ -102,11 +102,101 @@ test('/api/* is forwarded upstream', async (t) => {
     await hermes.stop();
   });
 
-  const response = await rawGet(proxy.port, '/api/status');
+  const paths = [
+    '/api/status',
+    '/api/sessions',
+    '/api/sessions/abc123/messages',
+    '/api/profiles',
+    '/api/profiles/sessions/sidebar',
+    '/api/cron/jobs',
+    '/api/cron/jobs/9be8b1662fb0/runs',
+    '/api/analytics/usage',
+  ];
+  for (const path of paths) {
+    const response = await rawGet(proxy.port, path);
+    assert.equal(response.status, 200, `${path} should be forwarded`);
+  }
+  assert.deepEqual(
+    hermes.requests.map((r) => r.url),
+    paths,
+  );
+});
+
+// The backend serves its whole dashboard API on this port, including secrets
+// and filesystem access. The proxy must refuse those without forwarding.
+test('sensitive endpoints are refused and never reach Hermes', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  const blocked = [
+    '/api/env',
+    '/api/env/reveal',
+    '/api/files/read',
+    '/api/fs/read-text',
+    '/api/ops/backup',
+    '/api/config/raw',
+    '/api/git/status',
+    '/api/gateway/restart',
+    '/api/pty',
+    '/api/statuspage',
+  ];
+  for (const path of blocked) {
+    const response = await rawGet(proxy.port, path);
+    assert.equal(response.status, 404, `${path} must be refused`);
+  }
+  assert.equal(hermes.requests.length, 0, 'nothing sensitive should have been forwarded');
+});
+
+test('write methods are refused even on allowlisted paths', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    const response = await rawRequest(proxy.port, method, '/api/cron/jobs/abc/trigger');
+    assert.equal(response.status, 404, `${method} must be refused`);
+  }
+  assert.equal(hermes.requests.length, 0);
+});
+
+test('the session token is added upstream but never exposed to the browser', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin, token: 'secret-token' });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  const response = await rawGet(proxy.port, '/api/cron/jobs');
   assert.equal(response.status, 200);
-  assert.equal(JSON.parse(response.body).upstream, true);
-  assert.equal(hermes.requests.length, 1);
-  assert.equal(hermes.requests[0].url, '/api/status');
+
+  assert.equal(hermes.requests[0].headers['x-hermes-session-token'], 'secret-token');
+  // The tailnet-facing forwarding headers must not leak to Hermes either.
+  assert.equal(hermes.requests[0].headers['x-forwarded-for'], undefined);
+  assert.equal(hermes.requests[0].headers['x-forwarded-host'], undefined);
+
+  const exposed = JSON.stringify(response.headers) + response.body;
+  assert.doesNotMatch(exposed, /secret-token/, 'token must never reach the client');
+});
+
+test('the JSON-RPC path is not reachable over plain HTTP', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  const response = await rawGet(proxy.port, '/api/ws');
+  assert.equal(response.status, 404);
+  assert.equal(hermes.requests.length, 0);
 });
 
 test('the session token is injected on the upstream upgrade, never sent by the browser', async (t) => {
