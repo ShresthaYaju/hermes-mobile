@@ -1,0 +1,15 @@
+{
+  "name": "tailscale-hermes-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Tailscale-only installable mobile web client for Hermes Agent.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test",
+    "check": "node --check server.mjs && node --check public/app.js"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1"
+  }
+}
