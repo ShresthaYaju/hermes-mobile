@@ -1,6 +1,8 @@
-# Hermes Mobile PWA
+# hermes-mobile
 
-An original, installable mobile chat surface for controlling the **same local Hermes Agent** you use through Telegram. It is intentionally not a clone of Claude or any other product UI.
+An installable mobile control surface for the **same local Hermes Agent** you use through Telegram.
+
+Today it is a chat client. [`PLAN.md`](PLAN.md) describes the path to a full management surface — sessions, cron jobs, and profiles — over the REST and JSON-RPC APIs the Hermes backend already exposes.
 
 ## Architecture
 
@@ -18,7 +20,7 @@ Both app processes bind only to loopback. `tailscale serve` is the only network 
 ## Install on this host
 
 ```bash
-cd ~/tailscale-hermes-pwa
+cd ~/hermes-mobile
 npm ci
 mkdir -p ~/.config/systemd/user
 umask 077
