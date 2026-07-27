@@ -6,11 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hermes-mobile-pwa.env
-WorkingDirectory=%h/tailscale-hermes-pwa
+WorkingDirectory=%h/hermes-mobile
 Environment=HOST=127.0.0.1
 Environment=PORT=4174
 Environment=HERMES_ORIGIN=http://127.0.0.1:9119
-ExecStart=%h/.local/bin/node %h/tailscale-hermes-pwa/server.mjs
+ExecStart=%h/.local/bin/node %h/hermes-mobile/server.mjs
 Restart=on-failure
 RestartSec=3
 
