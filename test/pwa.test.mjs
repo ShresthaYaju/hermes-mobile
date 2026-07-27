@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 test('PWA manifest is standalone and has an icon', () => {
-  const manifest = JSON.parse(readFileSync(new URL('../public/manifest.webmanifest', import.meta.url)));
+  const manifest = JSON.parse(
+    readFileSync(new URL('../public/manifest.webmanifest', import.meta.url)),
+  );
   assert.equal(manifest.display, 'standalone');
   assert.ok(manifest.icons?.length);
 });

@@ -36,7 +36,11 @@ proxy.on('error', (error, request, response) => {
   console.error('Hermes proxy error:', error.message);
   if (response && !response.headersSent) {
     response.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
-    response.end(JSON.stringify({ error: 'Hermes backend is unavailable. Check hermes-mobile-backend.service.' }));
+    response.end(
+      JSON.stringify({
+        error: 'Hermes backend is unavailable. Check hermes-mobile-backend.service.',
+      }),
+    );
   }
 });
 
@@ -55,7 +59,10 @@ function securityHeaders(response) {
   response.setHeader('X-Frame-Options', 'DENY');
   response.setHeader('Referrer-Policy', 'no-referrer');
   response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  response.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' wss: https:; img-src 'self' data:; style-src 'self'; script-src 'self'; manifest-src 'self'; worker-src 'self'");
+  response.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; connect-src 'self' wss: https:; img-src 'self' data:; style-src 'self'; script-src 'self'; manifest-src 'self'; worker-src 'self'",
+  );
 }
 
 function publicPath(urlPath) {
@@ -67,7 +74,10 @@ function publicPath(urlPath) {
 const server = http.createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
   if (url.pathname === '/healthz') {
-    response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    response.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    });
     response.end(JSON.stringify({ ok: true, hermesOrigin }));
     return;
   }
@@ -84,7 +94,10 @@ const server = http.createServer((request, response) => {
   }
   securityHeaders(response);
   response.setHeader('Content-Type', mimeTypes[extname(filePath)] ?? 'application/octet-stream');
-  response.setHeader('Cache-Control', filePath.endsWith('service-worker.js') ? 'no-cache' : 'public, max-age=3600');
+  response.setHeader(
+    'Cache-Control',
+    filePath.endsWith('service-worker.js') ? 'no-cache' : 'public, max-age=3600',
+  );
   createReadStream(filePath).pipe(response);
 });
 

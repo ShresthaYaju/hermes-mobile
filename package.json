@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "http-proxy": "^1.18.1"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.6"
   }
 }
