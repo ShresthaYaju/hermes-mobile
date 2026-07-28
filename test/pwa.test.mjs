@@ -18,6 +18,20 @@ test('PWA manifest is standalone and has an icon', () => {
   assert.ok(manifest.icons?.length);
 });
 
+// An installed iOS app resolves viewport units against a stale viewport at
+// first paint and corrects only on the first scroll, which floated the tab bar
+// above the home indicator. The shell must therefore never measure the
+// viewport -- it is pinned to it.
+test('the shell is pinned to the viewport rather than sized in viewport units', () => {
+  const css = read('styles.css');
+  assert.doesNotMatch(css, /height:\s*100(d|l|s)?vh/, 'no viewport-unit height on the shell');
+  assert.match(css, /body\s*\{[^}]*position:\s*fixed[^}]*\}/s, 'body must be viewport-pinned');
+  assert.match(css, /body\s*\{[^}]*overflow:\s*hidden[^}]*\}/s, 'the page itself must not scroll');
+  assert.match(css, /\.app\s*\{[^}]*height:\s*var\(--app-height,\s*100%\)/s);
+  // The fallback matters: it is what applies before the script runs.
+  assert.match(read('app.js'), /setProperty\('--app-height'/);
+});
+
 test('frontend only opens Hermes through the same-origin API WebSocket', () => {
   assert.match(read('lib/rpc.js'), /\/api\/ws/);
   // No module may reach past the proxy to the loopback backend, which would

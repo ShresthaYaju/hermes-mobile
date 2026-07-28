@@ -401,7 +401,9 @@ export function toast(message, kind = 'info') {
   let node = document.querySelector('.toast');
   if (!node) {
     node = el('div', { class: 'toast', role: 'status', 'aria-live': 'polite' });
-    document.body.append(node);
+    // Inside .app, not the body: the shell shrinks when the keyboard opens, and
+    // a toast anchored to the viewport would appear behind it.
+    (document.querySelector('.app') || document.body).append(node);
   }
   node.className = `toast toast--${kind} toast--visible`;
   node.textContent = message;

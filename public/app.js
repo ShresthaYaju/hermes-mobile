@@ -85,6 +85,26 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && !socket.connected) socket.connect();
 });
 
+// The shell is pinned to the viewport, which iOS does not shrink when the
+// keyboard opens -- so without this the composer would sit behind it. The
+// visual viewport is the one that does report the covered height.
+const viewport = window.visualViewport;
+if (viewport) {
+  const syncHeight = () => {
+    const root = document.documentElement;
+    root.style.setProperty('--app-height', `${Math.round(viewport.height)}px`);
+    // The home-indicator inset is meaningless once a keyboard covers that
+    // edge, and leaving it reads as a gap above the keyboard.
+    root.classList.toggle('keyboard-open', viewport.height < root.clientHeight - 80);
+    // A focused input can leave iOS scrolled inside a viewport that cannot
+    // scroll, which offsets everything by the keyboard's height.
+    if (viewport.offsetTop !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
+  };
+  viewport.addEventListener('resize', syncHeight);
+  viewport.addEventListener('scroll', syncHeight);
+  syncHeight();
+}
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/service-worker.js').catch(() => {});
 }
