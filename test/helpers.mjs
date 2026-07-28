@@ -14,6 +14,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 export async function startProxy({
   hermesOrigin = 'http://127.0.0.1:1',
   token = 'test-token',
+  env = {},
 } = {}) {
   const child = spawn(process.execPath, ['server.mjs'], {
     cwd: repoRoot,
@@ -23,6 +24,11 @@ export async function startProxy({
       PORT: '0',
       HERMES_ORIGIN: hermesOrigin,
       HERMES_DASHBOARD_SESSION_TOKEN: token,
+      // Never let a test inherit real VAPID keys from the developer's shell and
+      // start pushing to actual devices.
+      HERMES_MOBILE_VAPID_PUBLIC_KEY: '',
+      HERMES_MOBILE_VAPID_PRIVATE_KEY: '',
+      ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -101,20 +107,33 @@ export function rawGet(port, path, headers = {}) {
   return rawRequest(port, 'GET', path, headers);
 }
 
-export function rawRequest(port, method, path, headers = {}) {
+export function rawRequest(port, method, path, headers = {}, body) {
   return new Promise((resolve, reject) => {
-    const request = http.request({ host: '127.0.0.1', port, path, method, headers }, (response) => {
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () =>
-        resolve({
-          status: response.statusCode,
-          headers: response.headers,
-          body: Buffer.concat(chunks).toString('utf8'),
-        }),
-      );
-    });
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const request = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path,
+        method,
+        headers: payload
+          ? { 'content-type': 'application/json', 'content-length': payload.length, ...headers }
+          : headers,
+      },
+      (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () =>
+          resolve({
+            status: response.statusCode,
+            headers: response.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        );
+      },
+    );
     request.on('error', reject);
+    if (payload) request.write(payload);
     request.end();
   });
 }
