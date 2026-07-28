@@ -11,6 +11,7 @@ import {
   relativeTime,
   jobStatus,
   statusDot,
+  scheduleText,
   toast,
 } from '../lib/ui.js';
 import { navigate } from '../lib/router.js';
@@ -75,14 +76,7 @@ function renderJobs(node, jobs, reload) {
             'div',
             { class: 'row-main' },
             el('div', { class: 'row-title' }, job.name || job.id),
-            el(
-              'div',
-              { class: 'row-sub mono' },
-              job.schedule?.display || job.schedule_display || '',
-              job.next_run_at && status.key !== 'paused'
-                ? ` · next ${relativeTime(job.next_run_at)}`
-                : '',
-            ),
+            scheduleLine(job, status),
             status.detail
               ? el('div', { class: `row-sub row-sub--${status.key}` }, truncate(status.detail, 90))
               : null,
@@ -92,6 +86,18 @@ function renderJobs(node, jobs, reload) {
       ),
     );
   }
+}
+
+/**
+ * The schedule, in English where we can read the expression. Only an
+ * unrecognised expression stays monospaced -- at that point it is machine text
+ * being shown verbatim, and should look like it.
+ */
+function scheduleLine(job, status) {
+  const schedule = scheduleText(job);
+  const next =
+    job.next_run_at && status.key !== 'paused' ? ` · next ${relativeTime(job.next_run_at)}` : '';
+  return el('div', { class: `row-sub ${schedule.humanised ? '' : 'mono'}` }, schedule.text, next);
 }
 
 function jobActions(job, status, reload) {

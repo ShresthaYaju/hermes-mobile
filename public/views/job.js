@@ -11,6 +11,7 @@ import {
   clockTime,
   jobStatus,
   statusDot,
+  scheduleText,
   toast,
 } from '../lib/ui.js';
 import { navigate, back } from '../lib/router.js';
@@ -74,6 +75,7 @@ function renderHeader(node, job) {
 function renderBody(node, job, runs, reload) {
   clear(node);
   const status = jobStatus(job);
+  const schedule = scheduleText(job);
 
   node.append(
     el(
@@ -92,8 +94,18 @@ function renderBody(node, job, runs, reload) {
             : null,
         ),
       ),
-      kv('Schedule', job.schedule?.display || job.schedule_display || '—', true),
-      kv('Next run', status.key === 'paused' ? 'paused' : relativeTime(job.next_run_at) || '—'),
+      kv('Schedule', schedule.text || '—', !schedule.humanised),
+      // Keep the expression visible underneath: it is what you would edit, and
+      // the English above is this app's reading of it, not the source of truth.
+      schedule.humanised ? el('div', { class: 'kv-aside mono' }, schedule.raw) : null,
+      kv(
+        'Next run',
+        status.key === 'paused'
+          ? 'paused'
+          : job.next_run_at
+            ? `${clockTime(job.next_run_at)} · ${relativeTime(job.next_run_at)}`
+            : '—',
+      ),
       kv(
         'Last run',
         job.last_run_at

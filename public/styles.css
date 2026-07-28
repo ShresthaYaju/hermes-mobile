@@ -388,6 +388,14 @@ body {
   text-align: right;
 }
 
+/* The raw form of a value shown in English above it. */
+.kv-aside {
+  margin-top: -4px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  text-align: right;
+}
+
 /* State dots are never the only signal: each one sits beside a word that says
    the same thing, so the UI still reads without colour. */
 .dot {
