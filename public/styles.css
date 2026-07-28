@@ -67,6 +67,17 @@ body {
   font-variant-ligatures: none;
 }
 
+/* Every symbol in this app is a monochrome line glyph that inherits the
+   surrounding colour. Without this the OS substitutes its emoji font for
+   several of them and they arrive as colour stickers of the wrong weight. */
+.tab-glyph,
+.glyph,
+.approval-head,
+.tool-chevron {
+  font-family: var(--sans);
+  font-variant-emoji: text;
+}
+
 /* ---------------------------------------------------------------- shell -- */
 
 .app {

@@ -327,11 +327,14 @@ export function jobStatus(job) {
   return { key: 'ok', label: 'ok', detail: '' };
 }
 
+// Same rule as the tab bar: monochrome line glyphs, never colour emoji. Cron
+// shares the tab bar's ◷ rather than a clock emoji, and ✈︎ carries U+FE0E to
+// stop iOS substituting its emoji font.
 const SOURCE_GLYPHS = {
-  telegram: '✈',
+  telegram: '✈︎',
   whatsapp: '◍',
   discord: '◈',
-  cron: '⏱',
+  cron: '◷',
   subagent: '⑂',
   cli: '›',
   'web-pwa': '◐',
