@@ -151,7 +151,7 @@ test('sensitive endpoints are refused and never reach Hermes', async (t) => {
   assert.equal(hermes.requests.length, 0, 'nothing sensitive should have been forwarded');
 });
 
-test('write methods are refused even on allowlisted paths', async (t) => {
+test('the enumerated write actions are forwarded upstream', async (t) => {
   const hermes = await startFakeHermes();
   const proxy = await startProxy({ hermesOrigin: hermes.origin });
   t.after(async () => {
@@ -159,11 +159,50 @@ test('write methods are refused even on allowlisted paths', async (t) => {
     await hermes.stop();
   });
 
-  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
-    const response = await rawRequest(proxy.port, method, '/api/cron/jobs/abc/trigger');
-    assert.equal(response.status, 404, `${method} must be refused`);
+  const allowed = [
+    ['POST', '/api/cron/jobs/abc/pause'],
+    ['POST', '/api/cron/jobs/abc/resume'],
+    ['POST', '/api/cron/jobs/abc/trigger'],
+    ['PUT', '/api/cron/jobs/abc'],
+    ['PATCH', '/api/sessions/xyz'],
+    ['DELETE', '/api/sessions/xyz'],
+  ];
+  for (const [method, path] of allowed) {
+    const response = await rawRequest(proxy.port, method, path);
+    assert.equal(response.status, 200, `${method} ${path} should be forwarded`);
   }
-  assert.equal(hermes.requests.length, 0);
+  assert.equal(hermes.requests.length, allowed.length);
+});
+
+// The write allowlist is an enumeration, not a prefix match. Anything shaped
+// slightly differently must fall through to the refusal, not be waved past.
+test('writes outside the enumeration are refused and never reach Hermes', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  const blocked = [
+    // Deletes the job *and* rmtree()s its saved run output.
+    ['DELETE', '/api/cron/jobs/abc'],
+    ['POST', '/api/cron/jobs'],
+    ['POST', '/api/cron/jobs/abc/delete'],
+    ['POST', '/api/cron/jobs/abc/run-now'],
+    ['PUT', '/api/cron/jobs/abc/extra'],
+    ['POST', '/api/sessions/xyz'],
+    ['PUT', '/api/sessions/xyz'],
+    ['DELETE', '/api/sessions/xyz/messages'],
+    ['POST', '/api/ops/backup'],
+    ['POST', '/api/gateway/restart'],
+    ['PATCH', '/api/env'],
+  ];
+  for (const [method, path] of blocked) {
+    const response = await rawRequest(proxy.port, method, path);
+    assert.equal(response.status, 404, `${method} ${path} must be refused`);
+  }
+  assert.equal(hermes.requests.length, 0, 'nothing should have been forwarded');
 });
 
 test('the session token is added upstream but never exposed to the browser', async (t) => {

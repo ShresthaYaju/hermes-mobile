@@ -3,6 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import process from 'node:process';
 import httpProxy from 'http-proxy';
+import { createNotifications } from './notifications.mjs';
 
 const host = process.env.HOST ?? '127.0.0.1';
 const port = Number(process.env.PORT ?? 4174);
@@ -17,12 +18,8 @@ const publicDir = join(process.cwd(), 'public');
 // includes secrets (/api/env/reveal), filesystem access (/api/files), and
 // gateway lifecycle control (/api/ops). Anyone on the tailnet reaches this
 // proxy unauthenticated, so rather than forwarding /api/* wholesale we allow
-// only the read paths the mobile UI needs. Everything else is refused here and
-// never reaches Hermes.
-//
-// Writes (cron pause/trigger, session rename) are deliberately not enabled yet
-// -- they arrive with the write-actions work, together with the UI that makes
-// their blast radius visible.
+// only the paths the mobile UI needs. Everything else is refused here and never
+// reaches Hermes.
 const restReadPrefixes = [
   '/api/status',
   '/api/system/stats',
@@ -36,15 +33,32 @@ const restReadPrefixes = [
   '/api/model/info',
 ];
 
+// Writes are enumerated exactly, one method-plus-shape at a time, rather than
+// allowed by prefix. Two omissions are deliberate:
+//
+//   DELETE /api/cron/jobs/{id}  -- also rmtree()s the job's saved run output.
+//                                  A mis-tap on a phone is not worth that.
+//   POST   /api/cron/jobs       -- creating a schedule needs the blueprint and
+//                                  delivery-target UI to be honest about what
+//                                  it will do; it is not a mobile action.
+const restWriteRules = [
+  { method: 'POST', pattern: /^\/api\/cron\/jobs\/[^/]+\/(pause|resume|trigger)$/ },
+  { method: 'PUT', pattern: /^\/api\/cron\/jobs\/[^/]+$/ },
+  { method: 'PATCH', pattern: /^\/api\/sessions\/[^/]+$/ },
+  { method: 'DELETE', pattern: /^\/api\/sessions\/[^/]+$/ },
+];
+
 // The JSON-RPC gateway is a separate, already-working path with its own
 // credential handling in the upgrade handler.
 const websocketPath = '/api/ws';
 
 function isAllowedRestRequest(method, pathname) {
-  if (method !== 'GET' && method !== 'HEAD') return false;
-  return restReadPrefixes.some(
-    (prefix) => pathname === prefix || pathname.startsWith(`${prefix.replace(/\/$/, '')}/`),
-  );
+  if (method === 'GET' || method === 'HEAD') {
+    return restReadPrefixes.some(
+      (prefix) => pathname === prefix || pathname.startsWith(`${prefix.replace(/\/$/, '')}/`),
+    );
+  }
+  return restWriteRules.some((rule) => rule.method === method && rule.pattern.test(pathname));
 }
 
 const mimeTypes = {
@@ -148,11 +162,25 @@ function parseRequestUrl(request) {
   }
 }
 
+const notifications = createNotifications({ hermesOrigin, sessionToken: hermesSessionToken });
+
 const server = http.createServer((request, response) => {
   const url = parseRequestUrl(request);
   if (!url) {
     response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Bad request');
+    return;
+  }
+  // Push endpoints are served by this proxy itself, not forwarded to Hermes.
+  if (url.pathname.startsWith('/push/')) {
+    securityHeaders(response);
+    notifications.handleRequest(request, response, url).catch((error) => {
+      console.error('Push request failed:', error.message);
+      if (!response.headersSent) {
+        response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ error: 'Push request failed.' }));
+      }
+    });
     return;
   }
   if (url.pathname === '/healthz') {
@@ -219,4 +247,17 @@ server.listen(port, host, () => {
   const boundPort = typeof address === 'object' && address ? address.port : port;
   console.log(`Hermes mobile PWA listening on http://${host}:${boundPort}`);
   console.log(`Proxying /api/* to ${hermesOrigin}`);
+  if (notifications.enabled) {
+    notifications.start();
+    console.log('Watching scheduled jobs for failures (push enabled)');
+  } else {
+    console.log('Push notifications are off: set HERMES_MOBILE_VAPID_PUBLIC_KEY/PRIVATE_KEY');
+  }
 });
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    notifications.stop();
+    server.close(() => process.exit(0));
+  });
+}

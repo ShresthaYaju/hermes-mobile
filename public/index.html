@@ -3,49 +3,28 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#171512" />
+    <meta name="theme-color" content="#0e0e10" />
     <meta name="description" content="A private mobile control surface for Hermes Agent." />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icon.svg" />
     <link rel="stylesheet" href="/styles.css" />
-    <title>Hermes Mobile</title>
+    <title>Hermes</title>
   </head>
   <body>
-    <main class="app-shell">
+    <div class="app">
       <header class="topbar">
-        <button id="new-chat" class="icon-button" aria-label="Start a new conversation" title="New conversation">＋</button>
         <div class="brand"><span class="brand-mark">H</span><span>Hermes</span></div>
         <span id="connection" class="connection connection--idle" aria-live="polite">connecting</span>
       </header>
 
-      <section id="messages" class="messages" aria-live="polite" aria-label="Conversation">
-        <div class="welcome" id="welcome">
-          <div class="welcome-mark">H</div>
-          <h1>What can I help you do?</h1>
-          <p>This private app controls your Hermes Agent on this machine.</p>
-          <div class="suggestions">
-            <button data-prompt="What are my priorities today?">Plan my day</button>
-            <button data-prompt="Check the status of my active work.">Check active work</button>
-            <button data-prompt="Help me organize the next steps for my current project.">Organize a project</button>
-          </div>
-        </div>
-      </section>
+      <main id="outlet" class="outlet"></main>
 
-      <section id="activity" class="activity" hidden aria-live="polite"></section>
-      <section id="approval" class="approval" hidden aria-live="assertive"></section>
-
-      <form id="composer" class="composer">
-        <label class="sr-only" for="prompt">Message Hermes</label>
-        <textarea id="prompt" rows="1" placeholder="Message Hermes" autocomplete="off"></textarea>
-        <div class="composer-row">
-          <span class="composer-hint">Enter to send · Shift+Enter for a new line</span>
-          <button id="stop" type="button" class="stop" hidden>Stop</button>
-          <button id="send" type="submit" class="send" aria-label="Send message">↑</button>
-        </div>
-      </form>
-    </main>
-    <noscript>This app needs JavaScript to connect to Hermes.</noscript>
-    <script src="/app.js"></script>
+      <nav id="tabbar" class="tabbar" aria-label="Sections"></nav>
+    </div>
+    <noscript>This app needs JavaScript to reach your Hermes agent.</noscript>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
