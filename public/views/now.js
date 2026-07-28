@@ -146,7 +146,9 @@ function approvalCard({ id, payload }) {
     el(
       'div',
       { class: 'approval-head' },
-      '⚠',
+      // U+FE0E pins this to text, so the warning takes the card's colour
+      // instead of arriving as a yellow emoji triangle.
+      '⚠︎',
       el('span', {}, isClarify ? 'Needs an answer' : 'Allow this?'),
     ),
     el('pre', { class: 'approval-command mono' }, command),

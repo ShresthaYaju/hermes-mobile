@@ -10,12 +10,19 @@ import { chatView } from './views/chat.js';
 import { jobView } from './views/job.js';
 import { transcriptView } from './views/transcript.js';
 
+// Monochrome line glyphs only. Anything carrying the Unicode Emoji property
+// gets substituted with the OS emoji font on iOS and arrives as a colour
+// sticker at the wrong weight, however the standard classifies its default
+// presentation. ⏱︎ was doing exactly that, so Work uses ◷ from the same block
+// as ◉ -- same font, same stroke. ⚙︎ keeps its shape but takes U+FE0E, which
+// does pin it to text. test/glyphs.test.mjs enforces the rule, and treats a
+// comment no differently: this file contains no bare Emoji codepoint at all.
 const TABS = [
   { path: '/now', label: 'Now', glyph: '◉' },
   { path: '/threads', label: 'Threads', glyph: '☰' },
-  { path: '/work', label: 'Work', glyph: '⏱' },
+  { path: '/work', label: 'Work', glyph: '◷' },
   { path: '/chat', label: 'Chat', glyph: '✎' },
-  { path: '/config', label: 'Config', glyph: '⚙' },
+  { path: '/config', label: 'Config', glyph: '⚙︎' },
 ];
 
 defineRoute('/now', nowView);
