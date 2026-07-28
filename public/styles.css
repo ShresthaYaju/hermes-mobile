@@ -45,13 +45,23 @@
   box-sizing: border-box;
 }
 
-html,
-body {
+html {
   height: 100%;
   margin: 0;
 }
 
+/* Pinned to the viewport rather than sized in vh.
+ *
+ * An installed iOS app resolves 100dvh against a stale viewport at first
+ * paint and only corrects it on the first scroll or resize, which left the
+ * tab bar floating above the home indicator until you touched the screen.
+ * Nothing here measures the viewport, so there is nothing to correct. The
+ * page itself never scrolls; .outlet does. */
 body {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
@@ -80,10 +90,14 @@ body {
 
 /* ---------------------------------------------------------------- shell -- */
 
+/* --app-height tracks the visual viewport so the composer stays above the
+   on-screen keyboard; see app.js. 100% is the correct answer whenever no
+   keyboard is open, and the only answer before the script runs. */
 .app {
+  position: relative;
   display: flex;
   flex-direction: column;
-  height: 100dvh;
+  height: var(--app-height, 100%);
 }
 
 .topbar {
@@ -191,6 +205,10 @@ body {
   border-top: 1px solid var(--line-soft);
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   backdrop-filter: blur(12px);
+}
+
+.keyboard-open .tabbar {
+  padding-bottom: 0;
 }
 
 .tab {
@@ -1079,7 +1097,7 @@ body {
 }
 
 .toast {
-  position: fixed;
+  position: absolute;
   bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 14px);
   left: 50%;
   z-index: 20;
@@ -1103,6 +1121,10 @@ body {
 .toast--visible {
   opacity: 1;
   transform: translate(-50%, 0);
+}
+
+.keyboard-open .toast {
+  bottom: calc(var(--tabbar-h) + 14px);
 }
 
 .toast--error {
