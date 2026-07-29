@@ -14,5 +14,31 @@ ExecStart=%h/.local/bin/node %h/hermes-mobile/server.mjs
 Restart=on-failure
 RestartSec=3
 
+# This process terminates a network path from the tailnet, so give it as little
+# of the machine as it can run with. It only ever needs to read its own
+# directory, write the push-subscription file under ~/.local/state, and open
+# TCP sockets on loopback.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/hermes-mobile
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
 [Install]
 WantedBy=default.target

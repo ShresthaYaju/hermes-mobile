@@ -86,13 +86,23 @@ tailscale serve reset
 
 ## Security boundary
 
+**Read this before deploying it anywhere.** This app has no login of its own: whoever can reach the port can control the agent, and the agent can run shell commands. Reachability *is* authorization. That is a reasonable trade behind `tailscale serve`, where the tailnet does the authenticating, and a bad one anywhere else. The server refuses to bind a non-loopback address for that reason.
+
 - No model credentials or Hermes tokens are stored in this repository or sent to the browser. The loopback credential lives only in `~/.config/hermes-mobile-pwa.env` (mode `0600`) and the proxy adds it on the internal hop, to both the WebSocket upgrade and each REST call.
+- **Every `/api` and `/push` request must be same-origin.** A browser sets `Origin` itself and a page cannot forge or suppress it, so the proxy requires `Origin`'s host to match the `Host` it was reached by, and refuses `null`. This is the control that stops a hostile web page from driving the agent, and it matters most for WebSockets: they are exempt from CORS entirely, so nothing in the browser would have stopped the upgrade. A request with no `Origin` at all is not from a browser (curl, native clients) and is allowed. Set `HERMES_MOBILE_ALLOWED_ORIGINS` to permit additional origins.
 - **Hermes serves its entire dashboard API on that loopback port** — including `/api/env/reveal`, `/api/files`, `/api/ops`, and gateway lifecycle. The proxy therefore does not forward `/api/*` wholesale. Reads are allowed by prefix; writes are enumerated one method-and-shape at a time (`server.mjs`). Everything else is refused at the proxy and never reaches Hermes.
 - Two write actions are withheld on purpose: `DELETE /api/cron/jobs/{id}`, because it also deletes the job's saved run output, and cron job *creation*, which needs more context than a phone screen gives.
 - Push subscription endpoints are capability URLs and are stored `0600` outside the repo.
-- The service listens on `127.0.0.1`; HTTPS and tailnet authentication are provided by Tailscale Serve.
+- The service listens on `127.0.0.1`; HTTPS and tailnet authentication are provided by Tailscale Serve. Use `tailscale serve`, never `tailscale funnel` — funnel publishes it to the public internet.
 - Anyone with access to your tailnet URL can control this Hermes profile. Use tailnet ACLs/device access as the authorization boundary.
 - The app displays approval requests, but never auto-approves them.
+- The systemd unit runs under `ProtectSystem=strict` with a `@system-service` syscall filter and write access only to its own state directory.
+
+### Known limitations
+
+- **The REST allowlist does not constrain the JSON-RPC gateway.** `/api/ws` exposes the full method surface, `shell.exec` included. The same-origin check and the tailnet are what protect it; the careful REST allowlist is a second layer, not the primary one. Anyone with tailnet access has, in effect, a shell.
+- **No rate limiting or request timeouts** on the proxy.
+- **No audit log.** Actions taken through this app are indistinguishable, after the fact, from actions taken any other way.
 
 ## Development
 
