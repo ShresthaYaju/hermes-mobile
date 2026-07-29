@@ -2,3 +2,6 @@ node_modules/
 .env
 npm-debug.log*
 .DS_Store
+
+# Working notes: contains local paths, profile names and live session detail.
+PLAN.md
