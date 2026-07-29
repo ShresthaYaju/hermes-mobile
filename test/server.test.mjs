@@ -14,16 +14,15 @@ test('serves the app shell with security headers', async (t) => {
   assert.match(response.headers['content-security-policy'], /default-src 'self'/);
 });
 
-test('healthz reports the configured upstream', async (t) => {
+test('healthz reports liveness and nothing else', async (t) => {
   const proxy = await startProxy({ hermesOrigin: 'http://127.0.0.1:9119' });
   t.after(() => proxy.stop());
 
   const response = await rawGet(proxy.port, '/healthz');
   assert.equal(response.status, 200);
-  assert.deepEqual(JSON.parse(response.body), {
-    ok: true,
-    hermesOrigin: 'http://127.0.0.1:9119',
-  });
+  // It used to echo the upstream origin. A liveness probe has no business
+  // describing the internal topology to whoever asks.
+  assert.deepEqual(JSON.parse(response.body), { ok: true });
 });
 
 // Regression: GET /% threw an unhandled URIError out of decodeURIComponent and

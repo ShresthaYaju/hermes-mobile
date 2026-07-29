@@ -139,7 +139,7 @@ export function rawRequest(port, method, path, headers = {}, body) {
 }
 
 /** Attempt a WebSocket upgrade and report how the proxy handled it. */
-export function rawUpgrade(port, path) {
+export function rawUpgrade(port, path, headers = {}) {
   return new Promise((resolve, reject) => {
     const request = http.request({
       host: '127.0.0.1',
@@ -151,6 +151,7 @@ export function rawUpgrade(port, path) {
         Upgrade: 'websocket',
         'Sec-WebSocket-Key': Buffer.from('0123456789abcdef').toString('base64'),
         'Sec-WebSocket-Version': '13',
+        ...headers,
       },
     });
     const done = (value) => resolve(value);
