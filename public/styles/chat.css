@@ -1,0 +1,98 @@
+/* Owned by the chat work. Append only; no other area edits this file. */
+
+/* The transcript needs a positioning context for the jump button that does not
+   scroll with it, and the composer must keep its own height, so the scrollport
+   gets a wrapper rather than the view itself. */
+.chat-scroll {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.chat-scroll .transcript--chat {
+  width: 100%;
+}
+
+.jump-latest {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  padding: 6px 12px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 45%);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-variant-emoji: text;
+  cursor: pointer;
+}
+
+.jump-latest[hidden] {
+  display: none;
+}
+
+/* ------------------------------------------------- pending and failed -- */
+
+/* A queued message is a promise, not a sent message, and has to look like one:
+   the phone was asleep, and the difference is the whole point of the queue. */
+.msg--pending .bubble {
+  border: 1px dashed var(--line);
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.msg--failed .bubble {
+  border: 1px solid var(--accent-dim);
+}
+
+.msg-status {
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: right;
+}
+
+.msg--failed .msg-status {
+  color: var(--error);
+}
+
+.msg--assistant .msg-status,
+.msg--assistant .msg-actions {
+  text-align: left;
+  justify-content: flex-start;
+}
+
+/* --------------------------------------------------------- tap actions -- */
+
+/* No hover on a phone: the row appears when the message is tapped, or when it
+   is carrying a retry the user has to be able to reach without hunting. */
+.msg-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 5px;
+  justify-content: flex-end;
+}
+
+.msg-action {
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.msg-action--retry {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.msg--open .bubble {
+  outline: 1px solid var(--line);
+}

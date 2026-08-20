@@ -19,7 +19,7 @@ import { navigate, back } from '../lib/router.js';
 export function jobView({ id }) {
   const root = el('div', { class: 'view view--detail' });
   const header = el('header', { class: 'detail-head' });
-  const body = el('div', {}, spinner('Loading job'));
+  const body = el('div', { class: 'detail-body' }, spinner('Loading job'));
   root.append(header, body);
 
   let disposed = false;
@@ -120,11 +120,12 @@ function renderBody(node, job, runs, reload) {
             'Delivery is “local”: results are saved on the host but not sent anywhere, so failures are silent.',
           )
         : null,
+      // Controls belong to the job the card describes, so they live in it: the
+      // actions as its footer, the prompt as one more row that opens.
+      actionBar(job, status, reload),
+      promptEditor(job, reload),
     ),
   );
-
-  node.append(actionBar(job, status, reload));
-  node.append(promptEditor(job, reload));
 
   const history = el(
     'section',
@@ -180,22 +181,37 @@ function actionBar(job, status, reload) {
     ),
   );
 
-  return el('div', { class: 'action-bar' }, run, toggle);
+  return el('div', { class: 'job-actions' }, run, toggle);
 }
+
+// Whether the prompt is folded open. Module scope so a save-and-reload — or a
+// trip to a run transcript and back — does not snap it shut under the reader.
+let promptOpen = false;
 
 // Cron prompts carry operational policy ("NEVER submit an application"), so
 // the editor is full-height and monospaced rather than a one-line field, and
-// the save is explicit.
+// the save is explicit. A page of policy text also buries the run history, so
+// the editor folds away: closed it is one row of the detail card reading
+// "Prompt", labelled like the key/value rows above it.
 function promptEditor(job, reload) {
   const textarea = el('textarea', { class: 'textarea mono', rows: '10', spellcheck: 'false' });
   textarea.value = job.prompt || '';
   const save = el('button', { class: 'btn btn--primary', disabled: true }, 'Save prompt');
   const revert = el('button', { class: 'btn', disabled: true }, 'Revert');
 
+  const fold = el('details', { class: 'fold' });
+  fold.open = promptOpen;
+  fold.addEventListener('toggle', () => {
+    promptOpen = fold.open;
+  });
+
   const sync = () => {
     const changed = textarea.value !== (job.prompt || '');
     save.disabled = !changed;
     revert.disabled = !changed;
+    // Folding hides the Save button, so the closed row has to admit there are
+    // unsaved edits underneath it.
+    fold.classList.toggle('fold--dirty', changed);
   };
   textarea.addEventListener('input', sync);
   revert.addEventListener('click', () => {
@@ -206,12 +222,17 @@ function promptEditor(job, reload) {
     guard(save, () => api.updateJob(job.id, { prompt: textarea.value }), 'Prompt saved', reload),
   );
 
-  return el(
-    'section',
-    { class: 'section' },
-    el('h2', { class: 'section-title' }, 'Prompt'),
-    el('div', { class: 'card' }, textarea, el('div', { class: 'action-bar' }, save, revert)),
+  fold.append(
+    el(
+      'summary',
+      { class: 'fold-head' },
+      el('span', { class: 'fold-title' }, 'Prompt'),
+      el('span', { class: 'fold-flag' }, 'unsaved'),
+      el('span', { class: 'fold-chevron' }),
+    ),
+    el('div', { class: 'fold-body' }, textarea, el('div', { class: 'action-bar' }, save, revert)),
   );
+  return fold;
 }
 
 async function guard(button, fn, successMessage, reload) {

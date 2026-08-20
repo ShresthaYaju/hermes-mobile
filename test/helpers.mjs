@@ -28,6 +28,10 @@ export async function startProxy({
       // start pushing to actual devices.
       HERMES_MOBILE_VAPID_PUBLIC_KEY: '',
       HERMES_MOBILE_VAPID_PRIVATE_KEY: '',
+      // Suites that predate tailnet identity exercise other concerns and send
+      // no identity headers. Admit host-local callers by default so they keep
+      // testing what they were written to test; identity.test.mjs opts out.
+      HERMES_MOBILE_ALLOW_LOCAL: '1',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -68,6 +72,8 @@ export async function startProxy({
       return exited;
     },
     stderr: () => stderr.join(''),
+    // The audit trail is written to stdout, so tests read it from there.
+    stdout: () => buffered,
     async stop() {
       if (exited) return;
       child.kill('SIGKILL');

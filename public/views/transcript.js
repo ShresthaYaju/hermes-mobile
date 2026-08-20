@@ -1,25 +1,15 @@
-// Transcript -- a typed event log, not a message array.
+// Transcript -- read-only history for one session.
 //
-// Verified against the live API: assistant rows carry tool_calls with
-// {id, function:{name, arguments}}, paired to role:"tool" rows by
-// tool_call_id, alongside tool_name, reasoning and finish_reason. So the
-// collapsed tool row is buildable entirely client-side.
+// Rendering lives in lib/transcript.js because the chat view replays the same
+// stored history above its composer. This view is the read-only door: it never
+// attaches to a session, so opening one can never steal another transport's
+// event stream (PLAN.md, spike 2).
 
 import { api } from '../lib/api.js';
-import {
-  el,
-  clear,
-  spinner,
-  errorState,
-  emptyState,
-  relativeTime,
-  clockTime,
-  renderMarkdown,
-  copyText,
-  toast,
-  sourceGlyph,
-} from '../lib/ui.js';
+import { el, clear, spinner, errorState, emptyState, sourceGlyph } from '../lib/ui.js';
 import { back } from '../lib/router.js';
+import { renderTranscript, toolExpander } from '../lib/transcript.js';
+import { isOwnThread, telegramHref } from '../lib/threads.js';
 
 const PAGE = 200;
 
@@ -56,7 +46,11 @@ export function transcriptView({ id }) {
         );
         return;
       }
-      body.append(renderTranscript(messages));
+      // Both the toolbar and the note are optional, and append() coerces a
+      // null to the *string* "null" rather than skipping it -- el() filters,
+      // append() does not.
+      const list = renderTranscript(messages);
+      body.append(...[toolbar(session, list), list, readOnlyNote(session)].filter(Boolean));
     } catch (error) {
       if (disposed || error.name === 'AbortError') return;
       clear(body).append(errorState(error, load));
@@ -95,169 +89,58 @@ function renderHeader(node, session, id) {
   );
 }
 
-function renderTranscript(messages) {
-  const list = el('div', { class: 'transcript' });
-
-  // Index tool results so each call can render its own outcome inline.
-  const resultsByCallId = new Map();
-  for (const message of messages) {
-    if (message.role === 'tool' && message.tool_call_id) {
-      resultsByCallId.set(message.tool_call_id, message);
-    }
-  }
-
-  for (const message of messages) {
-    if (message.role === 'tool') continue; // rendered with its call
-    if (message.role === 'user') {
-      const text = textOf(message);
-      if (text)
-        list.append(
-          el('article', { class: 'msg msg--user' }, el('div', { class: 'bubble' }, text)),
-        );
-      continue;
-    }
-    if (message.role === 'assistant') {
-      const reasoning = message.reasoning || message.reasoning_content;
-      if (reasoning) list.append(thinkingRow(String(reasoning)));
-
-      const text = textOf(message);
-      if (text) {
-        list.append(
-          el(
-            'article',
-            { class: 'msg msg--assistant' },
-            el('div', { class: 'prose', html: renderMarkdown(text) }),
-          ),
-        );
-      }
-      for (const call of toolCalls(message)) {
-        list.append(toolRow(call, resultsByCallId.get(call.id)));
-      }
-      continue;
-    }
-    // Unknown record types must degrade to a quiet chip, never break the view.
-    if (message.role && message.role !== 'session_meta') {
-      list.append(el('div', { class: 'meta-chip mono' }, message.role));
-    }
-  }
-  return list;
+// The two controls that act on the transcript as a whole rather than on one
+// row. Both are optional, so the bar disappears entirely on a short cron run
+// with nothing to expand and nowhere to hand off to.
+function toolbar(session, list) {
+  const expander = toolExpander(list);
+  const handOff = telegramLink(session);
+  if (!expander && !handOff) return null;
+  return el('div', { class: 'transcript-tools' }, expander, handOff);
 }
 
-function textOf(message) {
-  const content = message.content;
-  if (typeof content === 'string') return content.trim();
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (typeof part === 'string' ? part : part?.text || ''))
-      .join('')
-      .trim();
-  }
-  return '';
-}
-
-function toolCalls(message) {
-  let raw = message.tool_calls;
-  if (!raw) return [];
-  if (typeof raw === 'string') {
-    try {
-      raw = JSON.parse(raw);
-    } catch {
-      return [];
-    }
-  }
-  if (!Array.isArray(raw)) return [];
-  return raw.map((call) => ({
-    id: call.id || call.call_id,
-    name: call.function?.name || call.name || 'tool',
-    args: call.function?.arguments ?? call.arguments ?? '',
-  }));
-}
-
-function thinkingRow(text) {
-  const details = el('details', { class: 'tool tool--thinking' });
-  details.append(
-    el(
-      'summary',
-      { class: 'tool-summary' },
-      el('span', { class: 'tool-chevron' }, '▸'),
-      el('span', { class: 'tool-name' }, 'thought'),
-    ),
-    el('pre', { class: 'tool-body mono' }, clip(text, 4000)),
+// The hand-off, and the reason it is a link rather than a composer: this app
+// cannot write into a Telegram thread, but Telegram is on the same phone.
+// telegramHref() returns null whenever it cannot name the right conversation
+// -- notably for direct messages with the bot -- and then there is no control
+// at all, because a button that opens the wrong chat is worse than none.
+function telegramLink(session) {
+  const href = telegramHref(session);
+  if (!href) return null;
+  return el(
+    'a',
+    { class: 'btn btn--small transcript-handoff', href, target: '_blank', rel: 'noopener' },
+    'Open in Telegram ',
+    el('span', { class: 'handoff-arrow', 'aria-hidden': 'true' }, '⇗'),
   );
-  return details;
 }
 
-function toolRow(call, result) {
-  const args = prettyArgs(call.args);
-  const summary = firstLine(args);
-  const failed =
-    result && /error|traceback|exception/i.test(String(result.content || '').slice(0, 200));
-
-  const details = el('details', { class: `tool ${failed ? 'tool--failed' : ''}` });
-  const head = el(
-    'summary',
-    { class: 'tool-summary' },
-    el('span', { class: 'tool-chevron' }, '▸'),
-    el('span', { class: 'tool-name mono' }, call.name),
-    el('span', { class: 'tool-arg mono' }, summary),
+// Say why there is no composer here. The honest reason is ownership, not a
+// missing feature: this conversation belongs to another process, and talking
+// into it from the phone would build a second agent on the same transcript.
+function readOnlyNote(session) {
+  const source = session?.source;
+  if (!source || isOwnThread(session)) return null;
+  const owner =
+    source === 'cron'
+      ? 'the scheduler'
+      : source === 'subagent'
+        ? 'its parent agent'
+        : `the ${source} surface`;
+  // Telegram is the one surface with a real answer to "then where do I reply?"
+  // -- it is on this phone. Name it either way, because the reply still has to
+  // happen there even when we could not build a link to the exact chat.
+  const elsewhere =
+    source === 'telegram'
+      ? telegramHref(session)
+        ? ' Continue it in Telegram.'
+        : ' Continue it in Telegram on this phone — a direct chat has no link this app can build.'
+      : ' Use the Chat tab for a conversation this app owns.';
+  return el(
+    'p',
+    { class: 'note note--transcript' },
+    `Read-only: this thread belongs to ${owner}. Replying here would start a second agent on the same history.${elsewhere}`,
   );
-  details.append(head);
-
-  const inner = el('div', { class: 'tool-detail' });
-  if (args) {
-    inner.append(
-      el('div', { class: 'tool-label' }, 'input'),
-      el('pre', { class: 'tool-body mono' }, clip(args, 4000)),
-    );
-  }
-  if (result) {
-    const output = String(result.content ?? '');
-    inner.append(
-      el('div', { class: 'tool-label' }, `output · ${output.split('\n').length} lines`),
-      el('pre', { class: 'tool-body mono' }, clip(output, 6000)),
-    );
-  }
-  inner.append(
-    el(
-      'button',
-      {
-        class: 'btn btn--small',
-        onclick: async () => {
-          const ok = await copyText(`${call.name} ${args}`.trim());
-          toast(ok ? 'Copied' : 'Could not copy', ok ? 'info' : 'error');
-        },
-      },
-      'Copy command',
-    ),
-  );
-  details.append(inner);
-  return details;
-}
-
-function prettyArgs(args) {
-  if (!args) return '';
-  if (typeof args === 'object') return JSON.stringify(args, null, 2);
-  try {
-    return JSON.stringify(JSON.parse(args), null, 2);
-  } catch {
-    return String(args);
-  }
-}
-
-function firstLine(text) {
-  if (!text) return '';
-  const compact = text
-    .replace(/\s+/g, ' ')
-    .replace(/^\{\s*/, '')
-    .trim();
-  return compact.length > 46 ? `${compact.slice(0, 46)}…` : compact;
-}
-
-function clip(text, max) {
-  const value = String(text);
-  return value.length > max
-    ? `${value.slice(0, max)}\n… ${value.length - max} more characters`
-    : value;
 }
 
 const shortPath = (path) => String(path).replace(/^\/home\/[^/]+/, '~');

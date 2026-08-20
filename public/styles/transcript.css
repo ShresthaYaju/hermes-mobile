@@ -1,0 +1,53 @@
+/* Owned by the transcript work. Append only; no other area edits this file. */
+
+/* Controls that act on the whole transcript. Sits above the first message so
+   it is reachable without scrolling a long log to either end. */
+.transcript-tools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+
+/* The hand-off is the answer to "then where do I reply?", so it sits at the
+   opposite end from the expander rather than beside it. */
+.transcript-handoff {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: auto;
+  text-decoration: none;
+}
+
+.handoff-arrow {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* Per-message chrome. A phone has no hover, so this is always visible and has
+   to stay quiet enough to read past -- faint, small, and out of the text
+   column's rhythm. It still needs a real touch target, hence the padding. */
+.msg-actions {
+  display: flex;
+  margin-top: 2px;
+}
+
+.msg--user .msg-actions {
+  justify-content: flex-end;
+}
+
+.msg-copy {
+  padding: 2px 6px;
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.msg-copy:active {
+  color: var(--text);
+}

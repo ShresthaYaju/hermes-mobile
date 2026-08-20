@@ -11,6 +11,12 @@
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icon.svg" />
     <link rel="stylesheet" href="/styles.css" />
+    <!-- Per-area sheets. styles.css owns the shared shell; each of these is
+         owned by one area so parallel work never contends on one stylesheet. -->
+    <link rel="stylesheet" href="/styles/shell.css" />
+    <link rel="stylesheet" href="/styles/chat.css" />
+    <link rel="stylesheet" href="/styles/config.css" />
+    <link rel="stylesheet" href="/styles/transcript.css" />
     <title>Hermes</title>
   </head>
   <body>

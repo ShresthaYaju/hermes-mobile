@@ -1,17 +1,75 @@
-// Chat -- the live conversation this app owns.
+// Chat -- one conversation, bound to a durable thread.
 //
-// Only sessions created here stream events (the gateway addresses events to
-// the transport that last touched a session, and there is no broadcast), so
-// this view holds exactly one session and does not try to attach to others.
+// Two ids are in play and conflating them is the whole trap:
+//
+//   * the THREAD id (`session.create`'s `stored_session_id`, shaped
+//     20260730_101500_ab12cd) is the row in state.db. It is what /api/sessions
+//     lists, what the Threads tab links to, and what survives disconnects.
+//   * the LIVE id (`session_id`, 8 hex) is a handle inside the gateway process
+//     for one attachment. Events and prompt.submit take this one, and it is
+//     thrown away whenever the socket drops.
+//
+// Sessions deliberately do NOT set close_on_disconnect. That flag reaps the
+// live handle the instant the socket drops -- and a phone drops its socket
+// every time it locks, so a long task fired off before pocketing the phone was
+// killed seconds later. Acceptable for a viewer; disqualifying for the primary
+// control surface.
+//
+// Without the flag the host parks the session instead (tui_gateway/server.py,
+// _close_sessions_for_transport). Two properties make that safe:
+//
+//   * a session with a turn in flight is never reaped -- _ws_session_is_orphaned
+//     returns false while `running`, so the work survives the phone sleeping;
+//   * an idle parked session is reaped after a 20s grace window, so nothing
+//     leaks, and a session.resume inside that window cancels the reap.
+//
+// So we reattach on reconnect rather than waiting for the next send.
+//
+// Attachment is lazy: opening a thread only reads REST. We resume (and so
+// build an agent, and so take over its event stream) at the moment the user
+// actually sends. Browsing a thread must never cost an agent.
+//
+// The one exception is the outbox (lib/store.js): a message composed while the
+// socket was down is text the user already committed to sending, so the
+// reconnect attaches for it. Queued text is shown in the transcript as pending
+// and flushed only once a live handle exists -- submitting against the handle
+// from the connection that just died loses the whole turn, because the gateway
+// answers the id it was given and that id is gone.
 
+import { api } from '../lib/api.js';
 import { socket } from '../lib/rpc.js';
-import { state, update } from '../lib/store.js';
-import { el, clear, renderMarkdown, relativeTime, toast, duration } from '../lib/ui.js';
+import {
+  state,
+  update,
+  queueMessage,
+  outboxFor,
+  dequeueMessage,
+  adoptQueued,
+} from '../lib/store.js';
+import { renderTranscript, textOf } from '../lib/transcript.js';
+import { OWN_SOURCE } from '../lib/threads.js';
+import { navigate } from '../lib/router.js';
+import {
+  el,
+  clear,
+  copyText,
+  errorState,
+  renderMarkdown,
+  relativeTime,
+  sessionTitle,
+  toast,
+  duration,
+} from '../lib/ui.js';
 
-const TRANSCRIPT_KEY = 'hermes-mobile-transcript-v1';
+const HISTORY_PAGE = 200;
 
-export function chatView() {
+export function chatView({ id } = {}) {
+  // "new" is a reserved draft route. Real thread ids are timestamped
+  // (20260730_101500_ab12cd), so the two can never collide.
+  const requested = id === 'new' ? null : id || null;
+
   const root = el('div', { class: 'view view--chat' });
+  const head = el('header', { class: 'chat-head' });
   const messages = el('div', { class: 'transcript transcript--chat' });
   const activity = el('div', { class: 'activity', hidden: true });
   const input = el('textarea', {
@@ -34,13 +92,176 @@ export function chatView() {
       send,
     ),
   );
-  root.append(messages, activity, composer);
+  // The jump button is a sibling of the scrollport, not a child of it: inside
+  // the transcript it would scroll away with the content it points at.
+  const jump = el(
+    'button',
+    { class: 'jump-latest', type: 'button', hidden: true, 'aria-label': 'Jump to latest' },
+    'Latest ↓',
+  );
+  root.append(head, el('div', { class: 'chat-scroll' }, messages, jump), activity, composer);
 
+  // The thread this view is bound to, and our current attachment to it. Both
+  // start empty for a draft: the thread is minted by the first send.
+  let threadId = requested;
+  let liveId = null;
   let assistantNode = null;
   let assistantText = '';
   let disposed = false;
+  let controller;
+  // Whether THIS thread has a turn in flight. The store's `running` is app-wide
+  // (it drives the Now tab), so composing against it would lock this thread's
+  // composer whenever any other thread was mid-turn -- the exact opposite of
+  // being able to switch context.
+  let running = false;
+  let startedAt = null;
+  // Queued entry id -> the bubble standing in for it, so a flush can mark the
+  // right message sent. Rebuilt from the store on every repaint.
+  const queuedNodes = new Map();
+  let flushing = false;
 
-  restore(messages);
+  // A reader who has scrolled up is reading. Streaming content must not drag
+  // them back down; it offers the jump button instead.
+  const NEAR_BOTTOM_PX = 48;
+  const atBottom = () =>
+    messages.scrollHeight - messages.scrollTop - messages.clientHeight < NEAR_BOTTOM_PX;
+  const syncJump = () => {
+    jump.hidden = atBottom();
+  };
+  const follow = () => {
+    if (atBottom()) scrollDown(messages);
+    else jump.hidden = false;
+  };
+  messages.addEventListener('scroll', syncJump, { passive: true });
+  jump.addEventListener('click', () => {
+    scrollDown(messages);
+    jump.hidden = true;
+  });
+
+  renderHead(null);
+
+  async function load() {
+    if (!threadId) {
+      // A draft has nothing to read -- the row does not exist until the first
+      // prompt, by design (abandoned drafts leave no "Untitled" session).
+      clear(messages).append(welcome());
+      paintQueued();
+      return;
+    }
+    controller?.abort();
+    controller = new AbortController();
+    const { signal } = controller;
+    try {
+      const [session, payload] = await Promise.all([
+        api.session(threadId, signal).catch(() => null),
+        api.messages(threadId, { limit: HISTORY_PAGE }, signal).catch(() => ({ messages: [] })),
+      ]);
+      if (disposed) return;
+      renderHead(session);
+      const history = payload?.messages || [];
+      clear(messages);
+      messages.append(history.length ? renderTranscript(history) : welcome());
+      hydrate(history);
+      paintQueued();
+      scrollDown(messages);
+    } catch (error) {
+      if (disposed || error.name === 'AbortError') return;
+      clear(messages).append(errorState(error, load));
+    }
+  }
+
+  /**
+   * Put each stored message's raw text back on the node it produced. The
+   * transcript renderer emits one .msg per user or assistant message that has
+   * text, in order, so the two line up -- and copy has to hand over the
+   * markdown the agent wrote, which its rendering no longer contains.
+   */
+  function hydrate(history) {
+    const texts = history
+      .filter((message) => message.role === 'user' || message.role === 'assistant')
+      .map(textOf)
+      .filter(Boolean);
+    const nodes = messages.querySelectorAll('.msg');
+    nodes.forEach((node, index) => {
+      if (texts[index] !== undefined) node.dataset.text = texts[index];
+    });
+  }
+
+  /** Repaint whatever is still waiting to be sent, below the stored history. */
+  function paintQueued() {
+    queuedNodes.clear();
+    const waiting = outboxFor(threadId);
+    if (!waiting.length) return;
+    messages.querySelector('.welcome')?.remove();
+    for (const entry of waiting) hold(append(messages, 'user', entry.text), entry);
+    scrollDown(messages);
+  }
+
+  // Resolve the Chat tab (#/chat, no id) to the thread you were last in, so
+  // the tab is a way back into the conversation rather than a way to lose it.
+  async function resolveLatest() {
+    try {
+      const payload = await api.sessions({
+        source: OWN_SOURCE,
+        limit: 1,
+        order: 'recent',
+        min_messages: 1,
+        archived: 'exclude',
+      });
+      const latest = (payload?.sessions || payload || [])[0];
+      if (disposed) return;
+      if (latest?.id) {
+        // Bind and paint here rather than routing: a replace: true navigation
+        // rewrites the URL without re-rendering, so nothing else would load.
+        threadId = latest.id;
+        navigate(`#/chat/${encodeURIComponent(latest.id)}`, { replace: true });
+      }
+    } catch {
+      // Fall through to a draft: an unreachable list must not block a new chat.
+    }
+    if (!disposed) await load();
+  }
+
+  // A queue can outlive the page that made it, and an app reopened online gets
+  // no reconnect to ride back in on -- so the first paint checks the outbox
+  // itself. Only ever for text the user already committed to sending: browsing
+  // still costs no agent.
+  (async () => {
+    if (id) await load();
+    else await resolveLatest();
+    if (!disposed && socket.connected && outboxFor(threadId).length) await flushOutbox();
+  })();
+
+  function renderHead(session) {
+    clear(head).append(
+      el(
+        'button',
+        { class: 'icon-btn', onclick: () => navigate('#/threads'), 'aria-label': 'All threads' },
+        '‹',
+      ),
+      el(
+        'div',
+        { class: 'detail-head-main' },
+        el('div', { class: 'detail-title' }, session ? sessionTitle(session) : 'New thread'),
+        el(
+          'div',
+          { class: 'detail-sub mono' },
+          session?.started_at ? relativeTime(session.started_at) : 'not started yet',
+          session?.model ? ` · ${session.model}` : '',
+        ),
+      ),
+      el(
+        'button',
+        {
+          class: 'icon-btn',
+          onclick: () => navigate('#/chat/new'),
+          'aria-label': 'New thread',
+          title: 'New thread',
+        },
+        '＋',
+      ),
+    );
+  }
 
   const resize = () => {
     input.style.height = 'auto';
@@ -48,7 +269,7 @@ export function chatView() {
   };
   input.addEventListener('input', () => {
     resize();
-    send.disabled = !input.value.trim() || state.running;
+    send.disabled = !input.value.trim() || running;
   });
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -61,51 +282,203 @@ export function chatView() {
     submit();
   });
   stop.addEventListener('click', async () => {
-    if (!state.sessionId) return;
+    if (!liveId) return;
     try {
-      await socket.call('session.interrupt', { session_id: state.sessionId });
+      await socket.call('session.interrupt', { session_id: liveId });
     } catch (error) {
       toast(error.message, 'error');
     }
   });
 
-  async function ensureSession() {
-    if (state.sessionId) return state.sessionId;
-    // close_on_disconnect:true so a dropped phone connection does not leave an
-    // orphaned session behind. History still persists server-side.
-    const created = await socket.call('session.create', {
-      source: 'hermes-mobile',
-      close_on_disconnect: true,
-    });
-    update({ sessionId: created.session_id });
-    return created.session_id;
+  /**
+   * Bind this view to a live gateway session, creating the thread on first use
+   * and resuming it on every later one. Returns the live id to submit against.
+   */
+  async function attach() {
+    if (liveId) return liveId;
+    if (threadId) {
+      const resumed = await socket.call('session.resume', {
+        session_id: threadId,
+        source: OWN_SOURCE,
+      });
+      liveId = resumed.session_id;
+    } else {
+      const created = await socket.call('session.create', {
+        source: OWN_SOURCE,
+      });
+      liveId = created.session_id;
+      threadId = created.stored_session_id;
+      // This is the one moment a draft becomes a thread, so it is where text
+      // queued before the thread existed acquires its address. Miss it and the
+      // queue stays keyed to no thread and is never found again.
+      adoptQueued(threadId);
+      // Put the thread in the URL immediately: a reload, a tab switch or a
+      // back gesture mid-turn must land back in this conversation, not a draft.
+      if (threadId) navigate(`#/chat/${encodeURIComponent(threadId)}`, { replace: true });
+    }
+    update({ sessionId: liveId, threadId });
+    return liveId;
   }
 
-  async function submit() {
+  function submit() {
     const text = input.value.trim();
-    if (!text || state.running) return;
-    append(messages, 'user', text);
-    persist(messages);
+    if (!text || running) return;
+    messages.querySelector('.welcome')?.remove();
     input.value = '';
     resize();
     send.disabled = true;
+    deliver(text);
+  }
+
+  /**
+   * Put one message on the wire, or in the outbox when it cannot go now.
+   *
+   * The composer is emptied the moment you hit send, so from here on the bubble
+   * is the only copy of your text until the outbox takes it -- which is why
+   * every failure below ends in a message you can still send, never in a lost
+   * one. `existing` re-sends a bubble that is already on screen (Retry).
+   */
+  async function deliver(text, existing) {
+    const node = existing || append(messages, 'user', text);
+    clearMessageState(node);
+    scrollDown(messages);
+    jump.hidden = true;
+    if (!socket.connected) {
+      hold(node);
+      return;
+    }
+    running = true;
+    startedAt = Date.now();
     assistantText = '';
     assistantNode = append(messages, 'assistant', '');
+    scrollDown(messages);
     try {
-      const sessionId = await ensureSession();
+      // Resuming a cold thread rebuilds its agent, which is seconds of work on
+      // a large transcript. Say so rather than showing an idle typing dot.
+      if (!liveId && threadId) update({ running: true, activity: 'attaching' });
+      renderActivity();
+      const sessionId = await attach();
       await socket.call('prompt.submit', { session_id: sessionId, text });
     } catch (error) {
       assistantNode?.remove();
       assistantNode = null;
-      systemLine(messages, error.message);
-      update({ running: false });
+      running = false;
+      startedAt = null;
+      update({ running: false, activity: null });
+      // Which failure it was decides what happens next: a socket that went away
+      // mid-send will come back and flush, while a gateway that refused the
+      // prompt will refuse it again, so that one waits for a deliberate retry.
+      if (!socket.connected) hold(node);
+      else fail(node, error.message);
+      renderActivity();
     }
   }
+
+  /** Mark a bubble as waiting, and queue its text if it is not queued already. */
+  function hold(node, existing) {
+    const entry = existing || queueMessage(threadId, node.dataset.text || '');
+    queuedNodes.set(entry.id, node);
+    node.dataset.queued = entry.id;
+    node.classList.add('msg--pending');
+    status(node, 'Queued · sends when Hermes is back');
+    return entry;
+  }
+
+  function fail(node, message) {
+    node.classList.add('msg--failed');
+    status(node, message || 'Not sent');
+  }
+
+  /** The gateway has it: the bubble is an ordinary message again. */
+  function release(node) {
+    if (!node) return;
+    queuedNodes.delete(node.dataset.queued);
+    delete node.dataset.queued;
+    clearMessageState(node);
+  }
+
+  function clearMessageState(node) {
+    node.classList.remove('msg--pending', 'msg--failed');
+    node.querySelector('.msg-status')?.remove();
+  }
+
+  function status(node, text) {
+    const line = node.querySelector('.msg-status') || el('div', { class: 'msg-status' });
+    line.textContent = text;
+    node.append(line);
+    renderActions(node);
+  }
+
+  // ------------------------------------------------------- copy and retry --
+  //
+  // There is no hover on a phone, so the actions are revealed by tapping the
+  // message. Delegated from the container because most of these bubbles were
+  // rendered by the shared transcript renderer, not built here.
+
+  const retryable = (node) =>
+    node.classList.contains('msg--failed') || node.classList.contains('msg--pending');
+
+  function renderActions(node) {
+    const existing = node.querySelector('.msg-actions');
+    if (!node.classList.contains('msg--open') && !retryable(node)) {
+      existing?.remove();
+      return;
+    }
+    const row = el(
+      'div',
+      { class: 'msg-actions' },
+      el('button', { class: 'msg-action', type: 'button', onclick: () => copy(node) }, 'Copy'),
+      retryable(node)
+        ? el(
+            'button',
+            { class: 'msg-action msg-action--retry', type: 'button', onclick: () => retry(node) },
+            node.classList.contains('msg--failed') ? 'Retry' : 'Send now',
+          )
+        : null,
+    );
+    if (existing) existing.replaceWith(row);
+    else node.append(row);
+  }
+
+  async function copy(node) {
+    // setText() keeps the raw text on the node. The rendering is lossy -- it is
+    // markdown turned into markup -- so it is never the thing to copy.
+    const ok = await copyText(node.dataset.text || '');
+    toast(ok ? 'Copied' : 'Could not copy', ok ? 'info' : 'error');
+  }
+
+  function retry(node) {
+    const text = node.dataset.text || '';
+    if (!text || running) return;
+    // Already durable: the queue owns this one, so a retry is a flush, not a
+    // second send. Sending it here would put the same text on the wire twice.
+    if (node.dataset.queued) flushOutbox();
+    else deliver(text, node);
+  }
+
+  messages.addEventListener('click', (event) => {
+    if (event.target.closest('button')) return;
+    const node = event.target.closest('.msg');
+    if (!node) return;
+    // A tap that ended a text selection was aimed at the text, not the message.
+    if (window.getSelection?.().toString()) return;
+    const open = node.classList.contains('msg--open');
+    for (const other of messages.querySelectorAll('.msg--open')) {
+      other.classList.remove('msg--open');
+      renderActions(other);
+    }
+    if (!open) node.classList.add('msg--open');
+    renderActions(node);
+  });
 
   const onEvent = ({ detail }) => {
     if (disposed) return;
     const { type, session_id: sessionId, payload = {} } = detail;
-    if (sessionId && state.sessionId && sessionId !== state.sessionId) return;
+    // Events are addressed to a live handle, so an unattached thread is deaf by
+    // definition: while we hold none, every event on the socket belongs to some
+    // other thread -- typically one left mid-turn -- and painting it here would
+    // put another conversation's reply in this transcript.
+    if (!liveId || (sessionId && sessionId !== liveId)) return;
     switch (type) {
       case 'message.start':
         assistantText = '';
@@ -130,29 +503,125 @@ export function chatView() {
         if (payload.status === 'interrupted') systemLine(messages, 'Interrupted');
         assistantNode = null;
         assistantText = '';
-        persist(messages);
+        running = false;
+        startedAt = null;
         break;
       }
       case 'error':
         systemLine(messages, payload.message || 'Hermes returned an error');
         assistantNode = null;
+        running = false;
+        startedAt = null;
         break;
       default:
         break;
     }
-    scrollDown(messages);
+    follow();
   };
   socket.addEventListener('event', onEvent);
 
+  // The live handle belongs to the socket that opened it, so a drop always
+  // invalidates it. The *thread* survives on the host (see the note at the top
+  // of this file), so on the way back we rebind rather than going deaf until
+  // the user happens to send again — a turn that kept running while the phone
+  // was locked has to stream here again, not finish into a view nobody told.
+  let wasAttached = false;
+
+  const onConnection = ({ detail }) => {
+    if (disposed) return;
+    if (detail.state !== 'live') {
+      wasAttached = Boolean(liveId);
+      liveId = null;
+      running = false;
+      startedAt = null;
+      // A placeholder with nothing in it is a typing dot for a reply that can
+      // no longer arrive on this connection.
+      if (assistantNode && !assistantText) {
+        assistantNode.remove();
+        assistantNode = null;
+      }
+      if (state.sessionId) update({ sessionId: null });
+      renderActivity();
+      return;
+    }
+    // Queued text is the user having already decided to send, so it is worth an
+    // attach on its own -- including for a draft, which has no thread to rebind.
+    if ((wasAttached && threadId) || outboxFor(threadId).length) {
+      wasAttached = false;
+      reattach();
+    }
+  };
+  socket.addEventListener('state', onConnection);
+
+  /**
+   * Rebind after a reconnect, catch the transcript up on whatever landed while
+   * we were away, then send anything that was composed offline. Failure is not
+   * fatal: the queue keeps until the next reconnect and the next send takes the
+   * ordinary cold-start path.
+   */
+  async function reattach() {
+    try {
+      await attach();
+      if (!disposed) await load();
+    } catch {
+      liveId = null;
+      return;
+    }
+    if (!disposed) await flushOutbox();
+  }
+
+  /**
+   * Send everything the outbox holds for this thread, oldest first.
+   *
+   * Called only once a live handle exists (see reattach): a flush that raced
+   * the reattach would submit against the handle from the connection that just
+   * dropped, and the gateway would answer an id nobody is listening to.
+   */
+  async function flushOutbox() {
+    if (flushing || disposed) return;
+    flushing = true;
+    let sent = 0;
+    try {
+      for (const entry of outboxFor(threadId)) {
+        if (disposed || !socket.connected) break;
+        const node = queuedNodes.get(entry.id);
+        try {
+          // Attaching here as well as in reattach() covers the draft case: a
+          // thread minted by the first entry is what the rest are sent into.
+          const sessionId = await attach();
+          await socket.call('prompt.submit', { session_id: sessionId, text: entry.text });
+          dequeueMessage(entry.id);
+          release(node);
+          sent += 1;
+        } catch (error) {
+          // The entry stays queued either way. A refusal is worth showing on
+          // the message it belongs to; a dropped socket is not, since the next
+          // reconnect will simply try again.
+          if (socket.connected && node) fail(node, error.message);
+          break;
+        }
+      }
+    } finally {
+      flushing = false;
+    }
+    if (!sent || disposed) return;
+    running = true;
+    startedAt = Date.now();
+    assistantText = '';
+    assistantNode = append(messages, 'assistant', '');
+    follow();
+    renderActivity();
+  }
+
   const renderActivity = () => {
     if (disposed) return;
-    stop.hidden = !state.running;
-    send.disabled = !input.value.trim() || state.running;
-    if (!state.running) {
+    stop.hidden = !running || !liveId;
+    send.disabled = !input.value.trim() || running;
+    if (!running) {
       activity.hidden = true;
       return;
     }
-    const elapsed = state.turnStartedAt ? (Date.now() - state.turnStartedAt) / 1000 : 0;
+    const elapsed = startedAt ? (Date.now() - startedAt) / 1000 : 0;
     activity.hidden = false;
     clear(activity).append(
       el('span', { class: 'dot dot--running' }),
@@ -166,11 +635,27 @@ export function chatView() {
   root.dispose = () => {
     disposed = true;
     clearInterval(ticker);
+    controller?.abort();
     socket.removeEventListener('event', onEvent);
+    socket.removeEventListener('state', onConnection);
+    // The live handle stays attached on the host: a turn left running keeps
+    // streaming into the DB, and the transcript is re-read on the way back in.
   };
   return root;
 }
 
+function welcome() {
+  return el(
+    'div',
+    { class: 'welcome' },
+    el('h1', {}, 'What can I help you do?'),
+    el('p', {}, 'This is a private conversation with the Hermes agent running on your machine.'),
+  );
+}
+
+// Neither of these scrolls: whether new content should pull the view down is
+// the caller's call, and for anything the agent said it depends on where the
+// reader is. See follow().
 function append(container, role, text) {
   const node = el(
     'article',
@@ -179,7 +664,6 @@ function append(container, role, text) {
   );
   container.append(node);
   setText(node, text);
-  scrollDown(container);
   return node;
 }
 
@@ -193,64 +677,10 @@ function setText(node, text) {
 
 function systemLine(container, text) {
   container.append(el('div', { class: 'system-line' }, text));
-  scrollDown(container);
 }
 
 function scrollDown(container) {
   requestAnimationFrame(() => {
     container.scrollTop = container.scrollHeight;
   });
-}
-
-// A local visual cache so a refresh does not look like data loss. Hermes holds
-// the real conversation state; this is only paint.
-function persist(container) {
-  const items = [...container.querySelectorAll('.msg')]
-    .map((node) => ({
-      role: node.classList.contains('msg--user') ? 'user' : 'assistant',
-      text: node.dataset.text || '',
-    }))
-    .filter((item) => item.text);
-  try {
-    localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(items.slice(-40)));
-  } catch {
-    // A full quota must never block sending.
-  }
-}
-
-function restore(container) {
-  let items = [];
-  try {
-    items = JSON.parse(localStorage.getItem(TRANSCRIPT_KEY) || '[]');
-  } catch {
-    localStorage.removeItem(TRANSCRIPT_KEY);
-  }
-  if (!items.length) {
-    container.append(
-      el(
-        'div',
-        { class: 'welcome' },
-        el('h1', {}, 'What can I help you do?'),
-        el(
-          'p',
-          {},
-          'This is a private conversation with the Hermes agent running on your machine.',
-        ),
-      ),
-    );
-    return;
-  }
-  for (const item of items) append(container, item.role, item.text);
-  container.append(
-    el(
-      'div',
-      { class: 'system-line' },
-      'Earlier messages are shown from this device; the agent starts a fresh session.',
-    ),
-  );
-}
-
-export function resetChat() {
-  localStorage.removeItem(TRANSCRIPT_KEY);
-  update({ sessionId: null });
 }

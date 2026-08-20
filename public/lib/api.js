@@ -83,7 +83,9 @@ export const api = {
     request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: { title } }),
   archiveSession: (id, archived) =>
     request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: { archived } }),
-  deleteSession: (id) => request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // No deleteSession: the proxy withdrew DELETE /api/sessions/{id} for the same
+  // reason it never exposed the cron delete. Archive instead — it is
+  // recoverable, and nothing here should be able to destroy a conversation.
 
   cronJobs: (signal) => request(`/api/cron/jobs${query({ profile: 'all' })}`, { signal }),
   cronRuns: (id, signal) =>
@@ -96,6 +98,30 @@ export const api = {
     request(`/api/cron/jobs/${encodeURIComponent(id)}`, { method: 'PUT', body: { updates } }),
 
   profiles: (signal) => request('/api/profiles', { signal }),
+  // No setActiveProfile: POST /api/profiles/active moves the sticky profile but
+  // leaves the running dashboard where it was, so the app would report a switch
+  // it had not made. The proxy withholds it for the same reason.
+
+  modelInfo: (signal) => request('/api/model/info', { signal }),
+  // The catalog is built from live provider calls upstream, so it is the one
+  // read here worth a spinner. `refresh` re-fetches each provider's model list
+  // instead of serving the hour-long disk cache; only ask for it when the user
+  // does.
+  modelOptions: (refresh, signal) =>
+    request(`/api/model/options${query({ refresh: refresh ? 1 : '' })}`, { signal }),
+
+  // Main slot only, and deliberately nothing else: the same endpoint writes
+  // per-task auxiliary pins, a provider base_url, and an API key into
+  // config.yaml, none of which belong behind a two-tap phone control.
+  //
+  // `confirm` re-sends an assignment the backend held back as expensive. It
+  // answers a question the user was just shown, so the caller must pass it
+  // explicitly rather than have this default to true and spend money quietly.
+  setModel: (provider, model, confirm = false) =>
+    request('/api/model/set', {
+      method: 'POST',
+      body: { scope: 'main', provider, model, confirm_expensive_model: confirm },
+    }),
 
   // Local to this app rather than Hermes: push subscription management.
   pushConfig: (signal) => request('/push/config', { signal }),
