@@ -22,6 +22,101 @@ const extraOrigins = new Set(
 // Hermes service. The browser never receives it: this proxy adds it only to
 // the upstream WebSocket handshake.
 const hermesSessionToken = process.env.HERMES_DASHBOARD_SESSION_TOKEN ?? '';
+
+// Tailnet identities permitted to drive the agent, comma separated, matched
+// against the Tailscale-User-Login header that `tailscale serve` injects.
+//
+// Same-origin (below) is a *browser* control: it stops a hostile page, and
+// nothing else. It cannot stop curl, which forges or omits Origin freely. So
+// until this existed, reachability was authorization -- and a tailnet has
+// peers. Any one of them could drive an agent with shell access using nothing
+// but a shell one-liner. This is the caller-side control that same-origin
+// cannot be.
+const allowedLogins = new Set(
+  (process.env.HERMES_MOBILE_ALLOWED_LOGINS ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+);
+
+// Admits callers that present no identity at all. Those cannot have arrived
+// through `tailscale serve` -- it always identifies -- so in practice this is
+// the host itself: local curl and the test suite. Off by default.
+const allowLocal = process.env.HERMES_MOBILE_ALLOW_LOCAL === '1';
+
+// Puts the reason for a refusal in the response body. Off by default because a
+// refusal should not tell an unauthorized caller how authorization works; on
+// when first wiring this up, to see what the proxy actually receives.
+const identityDebug = process.env.HERMES_MOBILE_IDENTITY_DEBUG === '1';
+
+/**
+ * Who is calling. `tailscale serve` sets Tailscale-User-Login for the
+ * authenticated tailnet user and strips any copy the client supplied, so the
+ * header is trustworthy *only* because reaching this port at all requires
+ * either loopback or passing through Serve.
+ */
+function identify(request) {
+  const login = String(request.headers['tailscale-user-login'] ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (!login) {
+    // No identity means the caller did not come through Serve, so it is local
+    // to the host -- where anyone able to make the request could equally well
+    // run the agent directly.
+    return allowLocal
+      ? { ok: true, login: 'local' }
+      : { ok: false, reason: 'no tailnet identity on the request' };
+  }
+  if (!allowedLogins.has(login)) {
+    return { ok: false, login, reason: 'identity is not on the allowlist' };
+  }
+  return { ok: true, login };
+}
+
+// Writes per identity per minute. Generous for a human tapping a phone, and
+// low enough that a script cannot sit in a loop on
+// POST /api/cron/jobs/{id}/trigger -- which runs the agent every time.
+const WRITE_LIMIT = Number(process.env.HERMES_MOBILE_WRITE_LIMIT ?? 30);
+const WRITE_WINDOW_MS = 60_000;
+const writeBudget = new Map();
+
+function withinWriteBudget(login) {
+  if (WRITE_LIMIT <= 0) return true;
+  const now = Date.now();
+  const entry = writeBudget.get(login);
+  if (!entry || now >= entry.resetAt) {
+    writeBudget.set(login, { count: 1, resetAt: now + WRITE_WINDOW_MS });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= WRITE_LIMIT;
+}
+
+/**
+ * One line per decision that reaches the agent, so there is a record of what
+ * drove it and as whom. Refusals were already logged; accepted writes were not,
+ * which meant the interesting half was invisible.
+ */
+function audit(outcome, { login, method, path }) {
+  console.log(
+    JSON.stringify({ at: new Date().toISOString(), audit: outcome, login, method, path }),
+  );
+}
+
+function refuseIdentity(response, pathname, verdict) {
+  console.warn(`Refused ${pathname} for ${verdict.login ?? '(no identity)'}: ${verdict.reason}`);
+  securityHeaders(response);
+  response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+  // Never name the allowlist here: a refusal must not teach the caller what
+  // would have worked.
+  response.end(
+    JSON.stringify({
+      error: 'This device is not authorized for Hermes.',
+      ...(identityDebug ? { detail: verdict.reason, seen: verdict.login ?? null } : {}),
+    }),
+  );
+}
 const publicDir = join(process.cwd(), 'public');
 
 // Hermes's backend serves its entire dashboard API on the loopback port, which
@@ -41,6 +136,11 @@ const restReadPrefixes = [
   '/api/analytics/',
   '/api/logs',
   '/api/model/info',
+  // The authenticated-provider catalog the Config picker lists. Named exactly
+  // rather than allowing /api/model, which would also hand over the MoA preset
+  // editor, the per-task auxiliary pins, and the recommended-default probe --
+  // none of which this app renders.
+  '/api/model/options',
 ];
 
 // Writes are enumerated exactly, one method-plus-shape at a time, rather than
@@ -51,11 +151,29 @@ const restReadPrefixes = [
 //   POST   /api/cron/jobs       -- creating a schedule needs the blueprint and
 //                                  delivery-target UI to be honest about what
 //                                  it will do; it is not a mobile action.
+//   DELETE /api/sessions/{id}   -- permanently destroys a conversation, which
+//                                  is the same class of mis-tap as the cron
+//                                  delete above and was inconsistent with it.
+//                                  No view ever called it. PATCH stays: rename
+//                                  and archive are recoverable.
+//   POST   /api/profiles/active -- switches the *sticky* profile without
+//                                  retargeting the running dashboard this app
+//                                  reads through, so the app would announce one
+//                                  profile while still showing another's
+//                                  sessions, jobs and model. Config says so
+//                                  rather than offering the switch.
 const restWriteRules = [
   { method: 'POST', pattern: /^\/api\/cron\/jobs\/[^/]+\/(pause|resume|trigger)$/ },
   { method: 'PUT', pattern: /^\/api\/cron\/jobs\/[^/]+$/ },
   { method: 'PATCH', pattern: /^\/api\/sessions\/[^/]+$/ },
-  { method: 'DELETE', pattern: /^\/api\/sessions\/[^/]+$/ },
+  // Assigns the main model in the profile the dashboard is running as -- the
+  // same profile /api/model/info reads back, so the picker cannot show one
+  // model while having written another. Upstream also honours base_url,
+  // api_key and an "auxiliary" scope on this route; a proxy cannot see a
+  // request body, so what keeps those off the phone is that no client here
+  // composes them (see api.js). The gap is bounded: reaching this at all
+  // already means passing the identity gate.
+  { method: 'POST', pattern: /^\/api\/model\/set$/ },
 ];
 
 // The JSON-RPC gateway is a separate, already-working path with its own
@@ -237,6 +355,15 @@ const server = http.createServer((request, response) => {
       refuseCrossOrigin(response, url.pathname);
       return;
     }
+    // Identity comes after same-origin so a hostile page is refused as such,
+    // and before anything is proxied or handled locally. Static assets are
+    // deliberately outside this gate: the shell has to be able to load in
+    // order to explain an authorization problem, and it carries no agent data.
+    const verdict = identify(request);
+    if (!verdict.ok) {
+      refuseIdentity(response, url.pathname, verdict);
+      return;
+    }
   }
   // Push endpoints are served by this proxy itself, not forwarded to Hermes.
   if (url.pathname.startsWith('/push/')) {
@@ -267,6 +394,22 @@ const server = http.createServer((request, response) => {
       response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ error: 'Not exposed by hermes-mobile.' }));
       return;
+    }
+    const write = request.method !== 'GET' && request.method !== 'HEAD';
+    if (write) {
+      const login = identify(request).login ?? 'unknown';
+      const entry = { login, method: request.method, path: url.pathname };
+      if (!withinWriteBudget(login)) {
+        audit('rate-limited', entry);
+        securityHeaders(response);
+        response.writeHead(429, {
+          'content-type': 'application/json; charset=utf-8',
+          'retry-after': '60',
+        });
+        response.end(JSON.stringify({ error: 'Too many actions in a row. Try again shortly.' }));
+        return;
+      }
+      audit('write', entry);
     }
     securityHeaders(response);
     proxy.web(request, response);
@@ -305,6 +448,15 @@ server.on('upgrade', (request, socket, head) => {
     socket.destroy();
     return;
   }
+  // The socket is the surface that matters: its JSON-RPC method set includes
+  // shell.exec, so an unidentified upgrade is remote code execution for anyone
+  // who can reach the port.
+  const who = identify(request);
+  if (!who.ok) {
+    console.warn(`Refused WebSocket upgrade for ${who.login ?? '(no identity)'}: ${who.reason}`);
+    socket.destroy();
+    return;
+  }
   if (!url || !url.pathname.startsWith('/api/') || !hermesSessionToken) {
     if (!hermesSessionToken) {
       console.error('Refusing WebSocket upgrade: HERMES_DASHBOARD_SESSION_TOKEN is not set.');
@@ -328,6 +480,33 @@ server.on('upgrade', (request, socket, head) => {
  * behind `tailscale funnel`, and publishing remote code execution to the
  * internet without realising it.
  */
+/**
+ * Starting with no allowlist and no local override would mean starting wide
+ * open to every peer on the tailnet, which is the exact failure the identity
+ * gate exists to prevent. Refuse, the same way a non-loopback bind is refused.
+ */
+if (!allowedLogins.size && !allowLocal) {
+  console.error(
+    [
+      'Refusing to start: no tailnet identity is authorized.',
+      '',
+      'Anyone who can reach this port can drive the agent, which includes',
+      'running shell commands through it. Name the tailnet logins allowed to',
+      'do that:',
+      '',
+      '  HERMES_MOBILE_ALLOWED_LOGINS=you@example.com',
+      '',
+      'That is the login `tailscale status` shows for your own node. Verify',
+      'what this proxy actually receives by starting it once with',
+      'HERMES_MOBILE_IDENTITY_DEBUG=1 and reading the refusal body.',
+      '',
+      'For a host-local session with no tailnet in front of it (tests, curl',
+      'from this machine), set HERMES_MOBILE_ALLOW_LOCAL=1 instead.',
+    ].join('\n'),
+  );
+  process.exit(1);
+}
+
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1']);
 if (!LOOPBACK.has(host) && process.env.HERMES_MOBILE_ALLOW_PUBLIC_BIND !== '1') {
   console.error(

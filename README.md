@@ -9,10 +9,10 @@ Five tabs:
 | **Now** | Is the gateway up, does the agent need a decision from me, what is running, what ran recently |
 | **Threads** | Every conversation across Telegram, the web app, scheduled runs, and subagents — searchable |
 | **Work** | Scheduled jobs, their health, and pause / resume / run-now / edit-prompt |
-| **Chat** | A live conversation with the agent, with streaming and approvals |
+| **Chat** | A live conversation with the agent, with streaming and approvals. Every chat is a durable thread you can leave and come back to |
 | **Config** | Profiles, push alerts, and what this app deliberately cannot reach |
 
-Tapping a thread or a run opens a Claude-Code-style transcript: tool calls as collapsed rows you expand for input and output. [`PLAN.md`](PLAN.md) records the review this was built from, including two architectural spikes that came back negative and changed the design.
+Tapping one of your own chats reopens it in the composer, with its history above the input; tapping any other thread or run opens a Claude-Code-style read-only transcript: tool calls as collapsed rows you expand for input and output. [`PLAN.md`](PLAN.md) records the review this was built from, including two architectural spikes that came back negative and changed the design.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ Both app processes bind only to loopback. `tailscale serve` is the only network 
 
 ### One thing worth knowing
 
-Hermes routes agent events to whichever transport last touched a session, with no broadcast. Telegram and cron sessions live in a *different OS process*, so this app cannot stream them — and resuming one over RPC would cold-load its history and spawn a second agent for it. So only the **Chat** tab streams; everything else reads REST and polls. This is architectural, not a gap in the UI.
+Hermes routes agent events to whichever transport last touched a session, with no broadcast. Telegram and cron sessions live in a *different OS process*, so this app cannot stream them — and resuming one over RPC would cold-load its history and spawn a second agent for it. So this app talks only into the threads it created itself, and everything else reads REST and polls. That ownership rule is enforced in `public/lib/threads.js` and pinned by `test/threads.test.mjs`. This is architectural, not a gap in the UI.
 
 ## Notifications (optional)
 
@@ -56,6 +56,9 @@ npm ci
 mkdir -p ~/.config/systemd/user
 umask 077
 printf 'HERMES_DASHBOARD_SESSION_TOKEN=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" > ~/.config/hermes-mobile-pwa.env
+# Who on the tailnet may drive the agent. The server refuses to start without
+# this — see "Security boundary". Use the login `tailscale status` shows you.
+printf 'HERMES_MOBILE_ALLOWED_LOGINS=you@example.com\n' >> ~/.config/hermes-mobile-pwa.env
 cp systemd/hermes-mobile-*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-mobile-backend.service hermes-mobile-pwa.service
@@ -86,15 +89,23 @@ tailscale serve reset
 
 ## Security boundary
 
-**Read this before deploying it anywhere.** This app has no login of its own: whoever can reach the port can control the agent, and the agent can run shell commands. Reachability *is* authorization. That is a reasonable trade behind `tailscale serve`, where the tailnet does the authenticating, and a bad one anywhere else. The server refuses to bind a non-loopback address for that reason.
+**Read this before deploying it anywhere.** The agent behind this app can run shell commands as your user, so the question "who may talk to it" is the whole security model.
+
+- **Only named tailnet identities may drive the agent.** `tailscale serve` authenticates the calling tailnet user and injects `Tailscale-User-Login`, stripping any copy the client supplied. The proxy requires that header on every `/api` and `/push` request *and* on the WebSocket upgrade, and matches it against `HERMES_MOBILE_ALLOWED_LOGINS` (comma separated). Anything else gets a 403 that does not disclose who *is* allowed. The server refuses to start with no allowlist, the same way it refuses a non-loopback bind — starting wide open is the failure this prevents.
+
+  This matters because same-origin is a *browser* control and nothing more: curl forges or omits `Origin` freely. Before the identity gate, reachability was authorization, and a tailnet has peers — any one of them could have driven the agent with a shell one-liner.
+
+  Set `HERMES_MOBILE_ALLOW_LOCAL=1` to additionally admit callers presenting no identity at all. Those cannot have come through Serve, so in practice it means the host itself (local curl, the test suite). Set `HERMES_MOBILE_IDENTITY_DEBUG=1` to have refusals name the identity they saw — useful exactly once, when first wiring this up.
+- **Actions that reach the agent are rate limited and recorded.** Writes are capped per identity per minute (`HERMES_MOBILE_WRITE_LIMIT`, default 30) so nothing can sit in a loop on `POST /api/cron/jobs/{id}/trigger`, which runs the agent every time. Each accepted or rate-limited write is written to stdout as a JSON audit line carrying the identity, method and path — `journalctl --user -u hermes-mobile-pwa.service` reads them. Reads are neither limited nor audited: they cannot run the agent, and one line per poll would bury the entries that matter.
 
 - No model credentials or Hermes tokens are stored in this repository or sent to the browser. The loopback credential lives only in `~/.config/hermes-mobile-pwa.env` (mode `0600`) and the proxy adds it on the internal hop, to both the WebSocket upgrade and each REST call.
 - **Every `/api` and `/push` request must be same-origin.** A browser sets `Origin` itself and a page cannot forge or suppress it, so the proxy requires `Origin`'s host to match the `Host` it was reached by, and refuses `null`. This is the control that stops a hostile web page from driving the agent, and it matters most for WebSockets: they are exempt from CORS entirely, so nothing in the browser would have stopped the upgrade. A request with no `Origin` at all is not from a browser (curl, native clients) and is allowed. Set `HERMES_MOBILE_ALLOWED_ORIGINS` to permit additional origins.
 - **Hermes serves its entire dashboard API on that loopback port** — including `/api/env/reveal`, `/api/files`, `/api/ops`, and gateway lifecycle. The proxy therefore does not forward `/api/*` wholesale. Reads are allowed by prefix; writes are enumerated one method-and-shape at a time (`server.mjs`). Everything else is refused at the proxy and never reaches Hermes.
-- Two write actions are withheld on purpose: `DELETE /api/cron/jobs/{id}`, because it also deletes the job's saved run output, and cron job *creation*, which needs more context than a phone screen gives.
+- Four write actions are withheld on purpose: `DELETE /api/cron/jobs/{id}`, because it also deletes the job's saved run output; cron job *creation*, which needs more context than a phone screen gives; `DELETE /api/sessions/{id}`, which permanently destroys a conversation; and `POST /api/profiles/active`, which moves the sticky profile without retargeting the running dashboard this app reads through — so the app would announce a switch it had not made. Renaming and archiving a thread stay available: they are recoverable.
+- `POST /api/model/set` **is** exposed, scoped to the main model slot. The same upstream endpoint can also write per-task auxiliary pins, a provider `base_url` and an API key into `config.yaml`. A proxy cannot inspect request bodies, so what keeps those off the phone is that no client here composes them — `public/lib/api.js` sends a main-slot assignment and nothing else, and a source-level test pins that. Treat it as a constraint to preserve, not a boundary the proxy enforces.
 - Push subscription endpoints are capability URLs and are stored `0600` outside the repo.
 - The service listens on `127.0.0.1`; HTTPS and tailnet authentication are provided by Tailscale Serve. Use `tailscale serve`, never `tailscale funnel` — funnel publishes it to the public internet.
-- Anyone with access to your tailnet URL can control this Hermes profile. Use tailnet ACLs/device access as the authorization boundary.
+- Tailnet ACLs are worth setting as a second layer: they are enforced by Tailscale rather than by this code, so they hold even if something here is wrong.
 - The app displays approval requests, but never auto-approves them.
 - The systemd unit runs under `ProtectSystem=strict` with a `@system-service` syscall filter and write access only to its own state directory.
 

@@ -1,5 +1,11 @@
 // Now -- the home surface. Answers, in order: is the agent alive, does it need
 // me, what is running, what happened recently.
+//
+// Three of those four change with nobody touching the phone, so this view is
+// also where the screen-reader story matters most. The rule followed here: a
+// live region only ever gets a DOM write when the thing it describes actually
+// changed. Re-rendering identical content into one makes a reader say it all
+// again, and this view used to rebuild its approvals on every activity tick.
 
 import { api } from '../lib/api.js';
 import { socket } from '../lib/rpc.js';
@@ -23,65 +29,101 @@ import { navigate } from '../lib/router.js';
 
 export function nowView() {
   const root = el('div', { class: 'view' });
-  const gateway = el('section', { class: 'card card--gateway' }, spinner('Checking gateway'));
-  const needs = el('section', { class: 'section' });
+  const gateway = el(
+    'section',
+    { class: 'card card--gateway', role: 'status', 'aria-label': 'Gateway' },
+    spinner('Checking gateway'),
+  );
+
+  // The heading stays put and only the cards live inside the region, so the
+  // name the region is announced under cannot vanish mid-announcement.
+  const needs = el('section', { class: 'section', 'aria-labelledby': 'now-needs-title' });
+  // Named from the start, so the region has an accessible name even while it
+  // is empty and the heading is hidden.
+  const needsTitle = el(
+    'h2',
+    { class: 'section-title section-title--alert', id: 'now-needs-title' },
+    'Needs you',
+  );
+  const needsList = el('div', { class: 'list', 'aria-live': 'assertive' });
+  needsTitle.hidden = true;
+  needs.append(needsTitle, needsList);
+
   const running = el('section', { class: 'section' });
+  // Only the edges of a turn are worth speaking. The tool-by-tool detail on
+  // the card below changes several times a minute and would bury everything
+  // else the reader is being told.
+  const activityStatus = el('p', { class: 'sr-only', role: 'status' });
   const recent = el('section', { class: 'section' });
-  root.append(gateway, needs, running, recent);
+  root.append(gateway, needs, running, activityStatus, recent);
 
   let disposed = false;
   let controller;
+  let approvalsKey = null;
+  let gatewayKey = null;
+  let recentKey = null;
+  let activityKey = null;
+  let elapsed = null;
 
   const renderApprovals = () => {
-    clear(needs);
+    // The store emits on every activity tick. Rebuilding these cards each time
+    // repeated the pending request to a reader every few seconds and wiped
+    // whatever had been typed into a clarify answer, so only a change to the
+    // set of open requests is allowed through.
+    const key = state.approvals.map((approval) => approval.id).join(' ');
+    if (key === approvalsKey) return;
+    approvalsKey = key;
+
+    clear(needsList);
+    needsTitle.hidden = !state.approvals.length;
     if (!state.approvals.length) return;
-    needs.append(
-      el(
-        'h2',
-        { class: 'section-title section-title--alert' },
-        'Needs you',
-        el('span', { class: 'count' }, String(state.approvals.length)),
-      ),
+    clear(needsTitle).append(
+      'Needs you',
+      el('span', { class: 'count', 'aria-hidden': 'true' }, String(state.approvals.length)),
+      el('span', { class: 'sr-only' }, `, ${state.approvals.length} pending`),
     );
-    for (const approval of state.approvals) needs.append(approvalCard(approval));
+    for (const approval of state.approvals) needsList.append(approvalCard(approval));
   };
 
   const renderActivity = () => {
-    clear(running);
-    if (!state.running && !state.activity) return;
-    const elapsed = state.turnStartedAt ? (Date.now() - state.turnStartedAt) / 1000 : 0;
-    running.append(
-      el('h2', { class: 'section-title' }, 'Running'),
+    const active = Boolean(state.running || state.activity);
+    const key = active ? state.activity || 'working' : '';
+    if (key !== activityKey) {
+      const wasActive = Boolean(activityKey);
+      activityKey = key;
+      clear(running);
+      elapsed = active ? el('span', { class: 'row-elapsed mono' }) : null;
+      if (active) running.append(el('h2', { class: 'section-title' }, 'Running'), activityCard());
+      if (active !== wasActive) {
+        activityStatus.textContent = active ? 'The agent is working' : 'The agent has stopped';
+      }
+    }
+    // Kept out of the live region above: a duration that ticks every second is
+    // the one thing a reader must never be given.
+    if (elapsed) {
+      elapsed.textContent = duration(
+        state.turnStartedAt ? (Date.now() - state.turnStartedAt) / 1000 : 0,
+      );
+    }
+  };
+
+  const activityCard = () =>
+    el(
+      'div',
+      { class: 'card row' },
+      statusDot('running'),
       el(
-        'div',
-        { class: 'card row row--tappable', onclick: () => navigate('#/chat') },
-        statusDot('running'),
-        el(
-          'div',
-          { class: 'row-main' },
-          el('div', { class: 'row-title' }, 'This conversation'),
-          el(
-            'div',
-            { class: 'row-sub mono' },
-            state.activity || 'working',
-            ' · ',
-            duration(elapsed),
-          ),
-        ),
-        el(
-          'button',
-          {
-            class: 'btn btn--stop',
-            onclick: (event) => {
-              event.stopPropagation();
-              stopTurn();
-            },
-          },
-          'Stop',
-        ),
+        'button',
+        { class: 'row-open row-main', onclick: () => navigate('#/chat') },
+        el('div', { class: 'row-title' }, 'This conversation'),
+        el('div', { class: 'row-sub mono' }, state.activity || 'working', ' · ', elapsed),
+      ),
+      el(
+        'button',
+        { class: 'btn btn--stop', onclick: stopTurn, 'aria-label': 'Stop the current turn' },
+        'Stop',
       ),
     );
-  };
 
   async function stopTurn() {
     if (!state.sessionId) return;
@@ -103,10 +145,23 @@ export function nowView() {
         api.cronJobs(signal).catch(() => []),
       ]);
       if (disposed) return;
-      renderGateway(gateway, status);
-      renderRecent(recent, Array.isArray(jobs) ? jobs : []);
+      const key = gatewayDigest(status);
+      if (key !== gatewayKey) {
+        gatewayKey = key;
+        renderGateway(gateway, status);
+      }
+      const runs = recentRuns(Array.isArray(jobs) ? jobs : []);
+      // Same reason as the card above, plus one of its own: these rows are
+      // buttons now, and rebuilding them drops whatever had focus.
+      const runsKey = recentDigest(runs);
+      if (runsKey !== recentKey) {
+        recentKey = runsKey;
+        renderRecent(recent, runs);
+      }
     } catch (error) {
       if (disposed || error.name === 'AbortError') return;
+      gatewayKey = null;
+      recentKey = null;
       clear(gateway).append(errorState(error, load));
     }
   }
@@ -124,6 +179,7 @@ export function nowView() {
   renderActivity();
   load();
 
+  root.refresh = load;
   root.dispose = () => {
     disposed = true;
     unsubscribe();
@@ -147,15 +203,21 @@ function approvalCard({ id, payload }) {
       'div',
       { class: 'approval-head' },
       // U+FE0E pins this to text, so the warning takes the card's colour
-      // instead of arriving as a yellow emoji triangle.
-      '⚠︎',
+      // instead of arriving as a yellow emoji triangle. It is decorative: the
+      // heading beside it already says what kind of card this is.
+      el('span', { 'aria-hidden': 'true' }, '⚠︎'),
       el('span', {}, isClarify ? 'Needs an answer' : 'Allow this?'),
     ),
     el('pre', { class: 'approval-command mono' }, command),
   );
 
   if (isClarify) {
-    const input = el('input', { class: 'input', placeholder: 'Your answer', autocomplete: 'off' });
+    const input = el('input', {
+      class: 'input',
+      placeholder: 'Your answer',
+      'aria-label': 'Your answer',
+      autocomplete: 'off',
+    });
     const respond = async () => {
       const answer = input.value.trim();
       if (!answer) return;
@@ -218,6 +280,21 @@ const CHOICE_LABELS = {
 };
 const labelForChoice = (choice) => CHOICE_LABELS[choice] || choice;
 
+const connectedPlatforms = (status) =>
+  Object.entries(status.gateway_platforms || {})
+    .filter(([, platform]) => platform?.state === 'connected')
+    .map(([name]) => name);
+
+/** Everything the gateway card shows, so the poll can tell a real change from a repeat. */
+function gatewayDigest(status) {
+  if (!status) return 'unreachable';
+  return JSON.stringify([
+    Boolean(status.gateway_running),
+    status.version || '',
+    connectedPlatforms(status),
+  ]);
+}
+
 function renderGateway(node, status) {
   clear(node);
   if (!status) {
@@ -228,8 +305,7 @@ function renderGateway(node, status) {
     return;
   }
   const up = Boolean(status.gateway_running);
-  const platforms = Object.entries(status.gateway_platforms || {});
-  const connected = platforms.filter(([, p]) => p?.state === 'connected').map(([name]) => name);
+  const connected = connectedPlatforms(status);
   node.append(
     statusDot(up ? 'ok' : 'error'),
     el(
@@ -246,13 +322,23 @@ function renderGateway(node, status) {
   );
 }
 
-function renderRecent(node, jobs) {
-  clear(node);
-  const withRuns = jobs
+const recentRuns = (jobs) =>
+  jobs
     .filter((job) => job.last_run_at)
     .sort((a, b) => new Date(b.last_run_at) - new Date(a.last_run_at))
     .slice(0, 6);
 
+/** The rendered text of the rows, so a poll that changed nothing rebuilds nothing. */
+const recentDigest = (runs) =>
+  JSON.stringify(
+    runs.map((job) => {
+      const status = jobStatus(job);
+      return [job.id, job.name || '', status.key, status.detail, relativeTime(job.last_run_at)];
+    }),
+  );
+
+function renderRecent(node, withRuns) {
+  clear(node);
   node.append(el('h2', { class: 'section-title' }, 'Recent scheduled runs'));
   if (!withRuns.length) {
     node.append(emptyState('Nothing has run yet.'));
@@ -262,7 +348,7 @@ function renderRecent(node, jobs) {
     const status = jobStatus(job);
     node.append(
       el(
-        'div',
+        'button',
         {
           class: 'card row row--tappable',
           onclick: () => navigate(`#/job/${encodeURIComponent(job.id)}`),

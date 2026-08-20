@@ -164,7 +164,6 @@ test('the enumerated write actions are forwarded upstream', async (t) => {
     ['POST', '/api/cron/jobs/abc/trigger'],
     ['PUT', '/api/cron/jobs/abc'],
     ['PATCH', '/api/sessions/xyz'],
-    ['DELETE', '/api/sessions/xyz'],
   ];
   for (const [method, path] of allowed) {
     const response = await rawRequest(proxy.port, method, path);
@@ -186,6 +185,9 @@ test('writes outside the enumeration are refused and never reach Hermes', async 
   const blocked = [
     // Deletes the job *and* rmtree()s its saved run output.
     ['DELETE', '/api/cron/jobs/abc'],
+    // Permanently destroys a conversation — withdrawn for parity with the cron
+    // delete above. Archive (PATCH) is the recoverable alternative.
+    ['DELETE', '/api/sessions/xyz'],
     ['POST', '/api/cron/jobs'],
     ['POST', '/api/cron/jobs/abc/delete'],
     ['POST', '/api/cron/jobs/abc/run-now'],
