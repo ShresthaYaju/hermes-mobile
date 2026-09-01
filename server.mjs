@@ -225,7 +225,7 @@ const restReadPrefixes = [
 ];
 
 // Writes are enumerated exactly, one method-plus-shape at a time, rather than
-// allowed by prefix. Two omissions are deliberate:
+// allowed by prefix. Four omissions are deliberate:
 //
 //   DELETE /api/cron/jobs/{id}  -- also rmtree()s the job's saved run output.
 //                                  A mis-tap on a phone is not worth that.
@@ -473,7 +473,8 @@ const server = http.createServer((request, response) => {
     // absolute form both make url.host a value the caller chose instead of the
     // Host header -- which is the value same-origin is about to be compared
     // against. No browser emits either; a raw socket does.
-    if (!request.url.startsWith('/') || request.url.startsWith('//')) {
+    const target = String(request.url ?? '');
+    if (!target.startsWith('/') || target.startsWith('//')) {
       refuseRequest(response, 400, 'Bad request.');
       return;
     }
