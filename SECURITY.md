@@ -52,9 +52,15 @@ deliberately withholds, without satisfying every control below:
 - Bypassing the tailnet identity gate (`Tailscale-User-Login` /
   `HERMES_MOBILE_ALLOWED_LOGINS`), on `/api/*`, `/push/*`, or the WebSocket
   upgrade.
-- Bypassing the same-origin check, especially on the WebSocket upgrade —
-  WebSockets are exempt from CORS, so this check is the only thing between a
-  hostile page and an authenticated JSON-RPC session.
+- Bypassing the same-origin check or the `Host` allowlist, especially on the
+  WebSocket upgrade — WebSockets are exempt from CORS, so those checks are the
+  only thing between a hostile page and an authenticated JSON-RPC session. A
+  way to make the proxy answer for a `Host` it should not, or to reach the
+  upgrade on a path other than `/api/ws`, is a serious finding: both were real
+  bugs here.
+- Getting the `Tailscale-User-Login` header believed off a non-loopback socket,
+  or getting a client-supplied copy of it — or of the session token — relayed
+  upstream.
 - Reaching a route the REST allowlist withholds — notably `/api/env/reveal`
   (plaintext secrets), `/api/files` (filesystem), `/api/ops` (gateway
   lifecycle) — by path traversal, encoding tricks, prefix confusion, or method
@@ -86,7 +92,11 @@ you can show one is worse than described, that very much is.
 - **`HERMES_MOBILE_ALLOW_LOCAL=1` admits callers with no identity header.**
   Those cannot have come through `tailscale serve`, so in practice this means
   the host itself — where the caller could run the agent directly anyway. It is
-  off by default and is for tests and local `curl`.
+  off by default and is for tests and local `curl`. Note that this used to be
+  much worse than it sounds: combined with DNS rebinding it meant any page the
+  host's browser visited could reach the RPC socket. The `Host` allowlist is
+  what closed that, so treat a rebinding bypass as critical rather than
+  theoretical.
 - **A missing `Origin` header is allowed.** A missing `Origin` means the caller
   is not a browser, and non-browser callers are stopped by the identity gate
   instead. `Origin: null` *is* refused.
@@ -104,12 +114,20 @@ Stated plainly, because the value of each one is easy to overestimate:
 | Control | Stops | Does **not** stop |
 | --- | --- | --- |
 | Loopback-only bind (refuses otherwise) | Exposure to the LAN or internet | Anything already on the host |
+| `Host` allowlist (loopback, `*.ts.net`, `100.64.0.0/10`) | DNS rebinding: a page you visit reaching the proxy on `127.0.0.1` | A caller who can set `Host` to a name you allowlisted |
 | `tailscale serve` | The public internet | Other peers on your tailnet |
 | Identity gate (`Tailscale-User-Login`) | Unlisted tailnet peers, `curl` from a peer | An allowlisted user, or anyone who can spoof the header *before* Serve |
-| Same-origin check | A hostile web page driving the agent | `curl`, native clients — they omit `Origin` freely |
+| Same-origin check | A hostile web page driving the agent | `curl`, native clients — they omit `Origin` freely, and rebinding used to defeat it before the `Host` allowlist |
 | REST allowlist | Withheld Hermes routes over HTTP | The WebSocket, which is the path that matters |
 | Write rate limit + audit log | A script looping on an agent-triggering write | A patient attacker |
 | Strict CSP | Exfiltration after a hypothetical XSS | The XSS itself |
+
+One more thing that is not in the table: the identity header is *trusted*, not
+verified. Nothing cryptographically binds it to a tailnet user. What makes it
+worth anything is that `tailscale serve` injects it and strips client-supplied
+copies, and that this proxy refuses it off a non-loopback socket. Put a
+different reverse proxy in front and you inherit the job of stripping it — on
+the same host, because otherwise the proxy will not believe it at all.
 
 Two things follow from that table. First, the same-origin check is a *browser*
 control and nothing more — before the identity gate existed, reachability was

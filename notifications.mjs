@@ -9,7 +9,7 @@
 // Everything here degrades to a no-op when VAPID keys are absent. The app must
 // stay fully usable without push configured.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import process from 'node:process';
@@ -17,6 +17,15 @@ import webpush from 'web-push';
 
 const POLL_MS = 60_000;
 const MAX_SUBSCRIPTIONS = 20;
+// Per identity, so a caller that floods subscriptions can only evict its own
+// devices. The global cap stays as a backstop: reaching it now needs four-plus
+// distinct allowlisted logins, and everyone on the allowlist can already drive
+// the agent, so cross-identity eviction is not the threat worth more code.
+const MAX_SUBSCRIPTIONS_PER_OWNER = 5;
+// Long enough for every real push service (FCM endpoints are ~200 chars) and
+// short enough that the state file cannot be used as free storage.
+const MAX_ENDPOINT_LENGTH = 2048;
+const MAX_KEY_LENGTH = 256;
 
 const defaultStateDir = () =>
   process.env.HERMES_MOBILE_STATE_DIR ||
@@ -46,6 +55,140 @@ const shorten = (text, n = 140) => {
     .trim();
   return value.length > n ? `${value.slice(0, n)}…` : value;
 };
+
+const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/** Octets of a dotted-quad, or null. The WHATWG URL parser has already
+ * canonicalised the shorthands (`https://2130706433/` arrives as 127.0.0.1),
+ * so only this one form has to be recognised here. */
+function ipv4Octets(host) {
+  const match = IPV4.exec(host);
+  if (!match) return null;
+  const octets = match.slice(1).map(Number);
+  return octets.every((octet) => octet <= 255) ? octets : null;
+}
+
+/** The eight 16-bit words of an IPv6 literal (brackets already stripped), or
+ * null. Written out rather than regexed because the ranges that matter --
+ * fc00::/7, fe80::/10, ::ffff:127.0.0.1 -- are numeric, not textual. */
+function ipv6Words(host) {
+  const toWords = (text) => {
+    if (!text) return [];
+    const parts = text.split(':');
+    const words = [];
+    for (const [index, part] of parts.entries()) {
+      const octets = ipv4Octets(part);
+      if (octets) {
+        // A dotted-quad tail (::ffff:127.0.0.1) fills the last two words.
+        if (index !== parts.length - 1) return null;
+        words.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
+      words.push(Number.parseInt(part, 16));
+    }
+    return words;
+  };
+
+  const halves = host.split('::');
+  if (halves.length > 2) return null;
+  const head = toWords(halves[0]);
+  const tail = halves.length === 2 ? toWords(halves[1]) : [];
+  if (!head || !tail) return null;
+  if (halves.length === 1) return head.length === 8 ? head : null;
+  const gap = 8 - head.length - tail.length;
+  return gap >= 1 ? [...head, ...Array(gap).fill(0), ...tail] : null;
+}
+
+function isInternalIpv4([a, b]) {
+  if (a === 127 || a === 10 || a === 0) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  // 100.64.0.0/10 is CGNAT, which is where Tailscale puts every node. An
+  // endpoint in this range is a subscription aimed back into the tailnet, and
+  // that is precisely the exfiltration case: payloads carry job names and
+  // error text, and the caller supplied the keys to decrypt them.
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return a >= 224;
+}
+
+function isInternalHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+
+  const octets = ipv4Octets(host);
+  if (octets) return isInternalIpv4(octets);
+
+  if (!host.includes(':')) return false;
+  const words = ipv6Words(host);
+  // An IPv6 literal we cannot parse is not one we can vouch for.
+  if (!words) return true;
+  if (words.every((word) => word === 0)) return true;
+  if (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true;
+  // ::ffff:a.b.c.d and the deprecated ::a.b.c.d both wrap a v4 address.
+  if (words.slice(0, 5).every((word) => word === 0) && (words[5] === 0xffff || words[5] === 0)) {
+    return isInternalIpv4([words[6] >> 8, words[6] & 0xff, words[7] >> 8, words[7] & 0xff]);
+  }
+  if ((words[0] & 0xfe00) === 0xfc00) return true; // fc00::/7, unique local
+  return (words[0] & 0xffc0) === 0xfe80; // fe80::/10, link local
+}
+
+/**
+ * Whether an endpoint is one this host is willing to keep and re-contact.
+ *
+ * web-push turns a stored endpoint into an https.request() from inside the
+ * tailnet, refired on every failing cron tick and surviving restarts, so an
+ * unvalidated endpoint is a durable SSRF primitive pointed wherever the caller
+ * likes. The reason is for the log, never for the response body: naming which
+ * rule bit would turn this into a probe oracle for the host's network.
+ */
+export function isDeliverableEndpoint(endpoint) {
+  if (typeof endpoint !== 'string' || !endpoint) return { ok: false, reason: 'missing endpoint' };
+  if (endpoint.length > MAX_ENDPOINT_LENGTH) return { ok: false, reason: 'endpoint too long' };
+
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return { ok: false, reason: 'endpoint is not a URL' };
+  }
+  if (url.protocol !== 'https:')
+    return { ok: false, reason: `scheme ${url.protocol} is not https` };
+  if (!url.hostname) return { ok: false, reason: 'endpoint has no host' };
+  if (isInternalHost(url.hostname)) {
+    return { ok: false, reason: `host ${url.hostname} is internal` };
+  }
+  return { ok: true };
+}
+
+/** Keys we cannot encrypt with are a subscription we can never deliver to, so
+ * there is no reason to store one -- and every reason not to let a caller park
+ * arbitrary strings in the state file. */
+function keysAreUsable(keys) {
+  for (const name of ['p256dh', 'auth']) {
+    const value = keys?.[name];
+    if (typeof value !== 'string' || !value || value.length > MAX_KEY_LENGTH) {
+      return { ok: false, reason: `unusable ${name}` };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Who is asking. server.mjs has already run the identity gate by the time a
+ * /push/* request reaches handleRequest, so this only reads the login back off
+ * the request to record it -- no second authorization decision is made here.
+ * An absent header cannot have come through `tailscale serve`, which always
+ * identifies, so it is the host itself.
+ */
+function callerLogin(request) {
+  return (
+    String(request?.headers?.['tailscale-user-login'] ?? '')
+      .trim()
+      .toLowerCase() || 'local'
+  );
+}
 
 /**
  * `deliver` is injectable purely so tests can observe delivery: web-push
@@ -80,11 +223,21 @@ export function createNotifications({
   function load() {
     try {
       const parsed = JSON.parse(readFileSync(statePath, 'utf8'));
+      const stored = Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [];
+      // Versions before endpoints were validated will have persisted whatever
+      // they were handed, so re-check on load: otherwise a bad endpoint written
+      // once keeps firing forever and upgrading fixes nothing already stored.
+      const kept = stored.filter((subscription) => {
+        const verdict = isDeliverableEndpoint(subscription?.endpoint);
+        if (!verdict.ok) console.warn('Dropping stored push endpoint:', verdict.reason);
+        return verdict.ok;
+      });
       state = {
-        subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
+        subscriptions: kept,
         signatures:
           parsed.signatures && typeof parsed.signatures === 'object' ? parsed.signatures : {},
       };
+      if (kept.length !== stored.length) save();
     } catch {
       // No state yet, or it was corrupted. Either way, start clean.
     }
@@ -92,26 +245,47 @@ export function createNotifications({
 
   function save() {
     try {
-      mkdirSync(dirname(statePath), { recursive: true });
+      mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
       // Subscription endpoints are capability URLs: anyone holding one can push
       // to the device. Keep the file owner-only.
       writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 });
     } catch (error) {
       console.error('Could not persist push state:', error.message);
+      return;
+    }
+    try {
+      // `mode` on writeFileSync only applies when the write creates the file,
+      // so an existing state file keeps whatever mode it already had. Until
+      // now the 0600 in production came from the unit's UMask=0077 rather than
+      // from anything this code did.
+      chmodSync(statePath, 0o600);
+    } catch (error) {
+      // A filesystem that cannot do POSIX modes is not a reason to take the
+      // process down; the write itself already succeeded.
+      console.error('Could not restrict push state permissions:', error.message);
     }
   }
 
-  function addSubscription(subscription) {
-    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
-      return { ok: false, error: 'Malformed subscription' };
-    }
+  function addSubscription(subscription, owner = null) {
+    const endpoint = isDeliverableEndpoint(subscription?.endpoint);
+    if (!endpoint.ok) return { ok: false, reason: endpoint.reason };
+    const keys = keysAreUsable(subscription?.keys);
+    if (!keys.ok) return { ok: false, reason: keys.reason };
+
     state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== subscription.endpoint);
     state.subscriptions.push({
       endpoint: subscription.endpoint,
       keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth },
+      owner,
     });
-    // Bound the list so a device that reinstalls repeatedly cannot grow the
-    // file without limit.
+    // Bound per identity first, so a device that reinstalls repeatedly -- or a
+    // caller doing it on purpose -- evicts only its own older registrations
+    // and never another person's phone.
+    const mine = state.subscriptions.filter((s) => s.owner === owner);
+    if (mine.length > MAX_SUBSCRIPTIONS_PER_OWNER) {
+      const evicted = new Set(mine.slice(0, mine.length - MAX_SUBSCRIPTIONS_PER_OWNER));
+      state.subscriptions = state.subscriptions.filter((s) => !evicted.has(s));
+    }
     if (state.subscriptions.length > MAX_SUBSCRIPTIONS) {
       state.subscriptions = state.subscriptions.slice(-MAX_SUBSCRIPTIONS);
     }
@@ -119,9 +293,23 @@ export function createNotifications({
     return { ok: true };
   }
 
-  function removeSubscription(endpoint) {
+  /**
+   * Removal is scoped to whoever registered the subscription. Without this one
+   * allowlisted-but-hostile caller -- or anyone at all when
+   * HERMES_MOBILE_ALLOW_LOCAL is on -- could silently unsubscribe another
+   * person's phone and leave them believing they were still being alerted.
+   *
+   * Subscriptions persisted before ownership was recorded stay removable by
+   * anyone rather than being migrated: on load there is no identity to
+   * attribute them to, and dropping them outright would stop alerts for a
+   * device that is still registered. The gap closes on its own, since browsers
+   * re-POST their subscription on every load.
+   */
+  function removeSubscription(endpoint, owner = null) {
     const before = state.subscriptions.length;
-    state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== endpoint);
+    state.subscriptions = state.subscriptions.filter(
+      (s) => s.endpoint !== endpoint || !(s.owner == null || s.owner === owner),
+    );
     if (state.subscriptions.length !== before) save();
     return { ok: true };
   }
@@ -238,14 +426,19 @@ export function createNotifications({
     if (url.pathname === '/push/subscribe' && request.method === 'POST') {
       const body = await readJson(request);
       if (!body) return json(response, 400, { error: 'Expected a JSON body.' });
-      const result = addSubscription(body);
-      return result.ok ? json(response, 204, null) : json(response, 400, { error: result.error });
+      const result = addSubscription(body, callerLogin(request));
+      if (result.ok) return json(response, 204, null);
+      console.warn('Refused push subscription:', result.reason);
+      // Deliberately uniform: which rule rejected it stays in the log.
+      return json(response, 400, { error: 'That push subscription was not accepted.' });
     }
 
     if (url.pathname === '/push/unsubscribe' && request.method === 'POST') {
       const body = await readJson(request);
       if (!body?.endpoint) return json(response, 400, { error: 'Expected an endpoint.' });
-      removeSubscription(String(body.endpoint));
+      // 204 whether or not anything was removed: a caller must not be able to
+      // learn which endpoints this host holds by probing for a different code.
+      removeSubscription(String(body.endpoint), callerLogin(request));
       return json(response, 204, null);
     }
 

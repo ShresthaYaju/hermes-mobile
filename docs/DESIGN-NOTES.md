@@ -91,6 +91,52 @@ no local override means the process refuses to start, the same way a non-loopbac
 refused. Starting wide open is the failure this prevents. Refusals do not name who *is*
 allowed.
 
+### Why same-origin needed a `Host` allowlist under it
+
+Same-origin was written as "the `Origin` header's host equals the `Host` we were reached by",
+which reads like a tautology-proof identity check and is not one. Both sides come from the
+request. An attacker who controls DNS for a name they own points it at `127.0.0.1`, and a page
+on that name sends `Origin: http://their-name` to `Host: their-name` — the two agree, because
+the attacker chose both. Classic DNS rebinding, and the check passes by construction.
+
+What made it serious rather than academic is the combination with `HERMES_MOBILE_ALLOW_LOCAL=1`,
+which is the documented way to develop against this app. With no identity required and
+same-origin satisfied, any page the host's own browser visited could open the JSON-RPC socket
+and get a shell. Through `tailscale serve` a remote browser is still stopped by TLS, so this
+was an exposure for the host itself and for anyone who bound the app publicly — which is to
+say, exactly the people running it from a checkout.
+
+The fix is that agreement is not enough: the `Host` has to be one this proxy expects. Loopback,
+the `*.ts.net` MagicDNS name Serve presents, and the `100.64.0.0/10` tailnet range are allowed
+by default, because those are what a correct deployment actually presents and none of them is
+a name an attacker can aim. Anything else needs naming in `HERMES_MOBILE_ALLOWED_HOSTS`.
+
+The general lesson, which applies to more than this app: a check that compares two
+attacker-supplied values to each other proves they agree, not that either is trustworthy.
+
+### Why the identity header is only believed from loopback
+
+`Tailscale-User-Login` is trusted verbatim — nothing binds it cryptographically to a tailnet
+user. Its entire value rests on Serve injecting it and stripping client copies. Serve proxies
+from the machine itself, so a request arriving from any other address means something else is
+in front, and the header is then just a string the caller typed. The proxy refuses it in that
+case rather than believing it. This costs nothing in a correct deployment and is the
+difference between "safe because of how this host happens to be configured" and "safe as
+published".
+
+The same reasoning drives refusing percent-encoded path separators. The REST allowlist matches
+a URL-normalized path, which collapses `..` — but normalizing is not decoding, and `%2f`,
+`%5c` and `%2e` survive it untouched. So `/api/status/..%2fenv%2freveal` passed the prefix
+check and arrived upstream still encoded, where a parser with different rules could decode it
+and resolve somewhere the proxy never authorized. Today's backend does not, so nothing was
+actually reachable. But "safe because of how the *other* program parses paths" is not a
+property a proxy gets to rely on, least of all one whose allowlist is the documented boundary.
+
+Worth recording precisely because the first diagnosis was wrong: the suspicion was that the
+proxy library forwarded the raw request target while the check ran on a normalized one. It
+does not — it derives the same normalized path this file does. The real gap was narrower and
+less obvious, and a fix aimed at the wrong mechanism would have closed nothing.
+
 ### Why there is no JSON-RPC method allowlist
 
 The REST surface is meticulously gated and `/api/ws` is proxied wholesale, which reads like

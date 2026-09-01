@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, statSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import webpush from 'web-push';
 import { startProxy, startFakeHermes, rawGet, rawRequest } from './helpers.mjs';
-import { createNotifications } from '../notifications.mjs';
+import { createNotifications, isDeliverableEndpoint } from '../notifications.mjs';
 
 // Generated per run rather than committed: a checked-in private key is a
 // credential, even a useless one.
@@ -88,6 +88,157 @@ test('malformed subscriptions are rejected', async (t) => {
   }
   const unknown = await rawGet(proxy.port, '/push/nope');
   assert.equal(unknown.status, 404);
+});
+
+// An endpoint is a standing instruction to make an outbound HTTPS request from
+// inside the tailnet, replayed on every failing cron tick and kept across
+// restarts, to a host the caller names -- and the caller supplies the keys, so
+// it can read the job names and error text in the payload. These pin the rule
+// that stops that.
+const REJECTED = {
+  'plain http': 'http://push.example/x',
+  'a file URL': 'file:///etc/passwd',
+  loopback: 'https://127.0.0.1/x',
+  'link-local metadata': 'https://169.254.169.254/latest/meta-data',
+  'the tailnet CGNAT range': 'https://100.100.100.100/x',
+  'a private range': 'https://10.1.2.3/x',
+  'IPv6 loopback': 'https://[::1]/x',
+  'an IPv4-mapped loopback': 'https://[::ffff:127.0.0.1]/x',
+  'unique local IPv6': 'https://[fd00::1]/x',
+  'not a URL at all': 'not-a-url',
+  'an over-long endpoint': `https://push.example/${'a'.repeat(2100)}`,
+};
+
+test('the endpoint rule accepts public HTTPS and nothing else', () => {
+  assert.equal(isDeliverableEndpoint('https://fcm.googleapis.com/fcm/send/abc').ok, true);
+  for (const [label, endpoint] of Object.entries(REJECTED)) {
+    const verdict = isDeliverableEndpoint(endpoint);
+    assert.equal(verdict.ok, false, `${label} must be refused`);
+    assert.ok(verdict.reason, `${label} must say why, for the log`);
+  }
+  // Decimal and octal shorthands reach the URL parser as dotted quads, so the
+  // numeric checks see the canonical form rather than the text the caller sent.
+  assert.equal(isDeliverableEndpoint('https://2130706433/x').ok, false);
+  assert.equal(isDeliverableEndpoint('https://sub.localhost/x').ok, false);
+});
+
+test('only deliverable endpoints are persisted', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const good = 'https://fcm.googleapis.com/fcm/send/good';
+  const accepted = await rawRequest(proxy.port, 'POST', '/push/subscribe', {}, subscription(good));
+  assert.equal(accepted.status, 204);
+
+  const statePath = join(stateDir, 'push-state.json');
+  assert.match(readFileSync(statePath, 'utf8'), /fcm\/send\/good/);
+
+  for (const [label, endpoint] of Object.entries(REJECTED)) {
+    const response = await rawRequest(
+      proxy.port,
+      'POST',
+      '/push/subscribe',
+      {},
+      subscription(endpoint),
+    );
+    assert.equal(response.status, 400, `${label} should be refused`);
+    // The body must not name the rule that fired: that would make this a probe
+    // for what the host can reach.
+    assert.doesNotMatch(response.body, /scheme|internal|host/i);
+  }
+  const state = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.deepEqual(
+    state.subscriptions.map((s) => s.endpoint),
+    [good],
+  );
+});
+
+test('keys that cannot be encrypted with are refused', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/keys';
+  for (const keys of [{ p256dh: 1, auth: 'x' }, { auth: 'x' }, { p256dh: 'x'.repeat(300) }]) {
+    const response = await rawRequest(
+      proxy.port,
+      'POST',
+      '/push/subscribe',
+      {},
+      {
+        endpoint,
+        keys,
+      },
+    );
+    assert.equal(response.status, 400);
+  }
+  assert.equal(existsSync(join(stateDir, 'push-state.json')), false, 'nothing was stored');
+});
+
+const OWNER = 'owner@example.com';
+const STRANGER = 'stranger@example.com';
+const identified = (login) => ({ 'Tailscale-User-Login': login });
+
+test('a subscription can only be removed by the identity that created it', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({
+    env: {
+      ...withVapid(stateDir),
+      HERMES_MOBILE_ALLOWED_LOGINS: `${OWNER},${STRANGER}`,
+      HERMES_MOBILE_ALLOW_LOCAL: '',
+    },
+  });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/owned';
+  const added = await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    identified(OWNER),
+    subscription(endpoint),
+  );
+  assert.equal(added.status, 204);
+
+  const statePath = join(stateDir, 'push-state.json');
+  const stranger = await rawRequest(proxy.port, 'POST', '/push/unsubscribe', identified(STRANGER), {
+    endpoint,
+  });
+  // 204 either way: the response must not reveal whether the endpoint is held.
+  assert.equal(stranger.status, 204);
+  assert.match(readFileSync(statePath, 'utf8'), /fcm\/send\/owned/, 'still subscribed');
+
+  const owner = await rawRequest(proxy.port, 'POST', '/push/unsubscribe', identified(OWNER), {
+    endpoint,
+  });
+  assert.equal(owner.status, 204);
+  assert.doesNotMatch(readFileSync(statePath, 'utf8'), /fcm\/send\/owned/);
+});
+
+test('the state file and its directory stay owner-only after a rewrite', async (t) => {
+  // A directory the server has to create itself, so the mkdir mode is what is
+  // under test rather than mkdtemp's.
+  const stateDir = join(tempStateDir(t), 'state');
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const first = 'https://fcm.googleapis.com/fcm/send/one';
+  await rawRequest(proxy.port, 'POST', '/push/subscribe', {}, subscription(first));
+  const statePath = join(stateDir, 'push-state.json');
+  assert.equal(statSync(stateDir).mode & 0o777, 0o700);
+
+  // writeFileSync's mode only applies to a create, so a file that already went
+  // world-readable stayed that way through every later write.
+  chmodSync(statePath, 0o644);
+  await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    {},
+    subscription('https://fcm.googleapis.com/fcm/send/two'),
+  );
+  assert.equal(statSync(statePath).mode & 0o777, 0o600);
 });
 
 test('push endpoints are handled locally and never forwarded to Hermes', async (t) => {
