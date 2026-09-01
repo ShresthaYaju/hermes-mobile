@@ -267,3 +267,191 @@ test('a write limit of zero refuses writes rather than permitting every one', as
   assert.equal(response.status, 429);
   assert.equal(hermes.requests.length, 0);
 });
+
+// Round two: the same three values, trusted a little further again.
+//
+// The request line is not the Host header. `GET /\100.64.0.1/api/ws` parses to
+// a host the allowlist vouches for while the Host header says something else,
+// and the upgrade handler -- the one that attaches the session token -- checked
+// the target's shape not at all. A separator has more spellings than the
+// canonical one, and `%c0%af` is a separator to enough parsers to matter. An
+// exclusion that matches literally is not an exclusion: `/trigger/`, `/TRIGGER`
+// and `/%74rigger` all route to trigger upstream. Two refusals were wrong in
+// the other direction, and a false negative here reads as a broken app. And
+// /push, which the identity gate named but the write budget did not.
+//
+// These use a strict configuration and carry the identity explicitly, and they
+// send no Origin: with one, same-origin refuses the smuggled targets first and
+// for an entirely different reason, which would prove nothing about the Host
+// allowlist.
+
+const IDENTITY = 'ok@example.com';
+const strictEnv = { HERMES_MOBILE_ALLOW_LOCAL: '', HERMES_MOBILE_ALLOWED_LOGINS: IDENTITY };
+const identified = (extra = {}) => ({ 'Tailscale-User-Login': IDENTITY, ...extra });
+const smuggled = identified({ Host: 'attacker.example' });
+
+test('a request target cannot stand in for the Host header', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // The WHATWG parser reads `\` as `/` for a special scheme, so this parses to
+  // host 100.64.0.1 -- inside the CGNAT range the allowlist vouches for --
+  // while the Host header says attacker.example. The decision belongs to the
+  // header; the request line is the caller's to write.
+  const response = await rawGet(proxy.port, '/\\100.64.0.1/api/status', smuggled);
+
+  assert.equal(response.status, 400);
+  assert.equal(hermes.requests.length, 0, 'a smuggled host must not reach Hermes');
+});
+
+test('no smuggled target may open the socket, least of all carrying the token', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv, token: 'secret-token' });
+
+  // This is the serious one. The upgrade handler appends the session token
+  // before forwarding, so each of these reached the JSON-RPC gateway -- whose
+  // method surface includes shell.exec -- authenticated, from a Host the
+  // allowlist would have refused outright.
+  const targets = ['/\\100.64.0.1/api/ws', '//node.ts.net/api/ws', 'http://node.ts.net/api/ws'];
+  for (const target of targets) {
+    const result = await rawUpgrade(proxy.port, target, smuggled);
+    assert.notEqual(result.outcome, 'upgraded', `${target} must not upgrade`);
+  }
+
+  assert.equal(hermes.upgrades.length, 0, 'no smuggled upgrade may reach the gateway');
+  assert.deepEqual(
+    hermes.upgrades.filter((upgrade) => upgrade.url.includes('token=')),
+    [],
+    'and none may arrive carrying the session token',
+  );
+});
+
+test('the socket still opens for a Host the allowlist vouches for', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv, token: 'secret-token' });
+
+  await rawUpgrade(proxy.port, '/api/ws', identified({ Host: 'hermes.tail1234.ts.net' }));
+
+  assert.equal(hermes.upgrades.length, 1, 'the real socket must still work');
+  assert.match(hermes.upgrades[0].url, /token=secret-token/);
+});
+
+test('an overlong or malformed escape is refused, an ordinary one is not', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // %c0%af and %e0%80%af are overlong UTF-8 spellings of `/`; `%%32%66` is a
+  // malformed escape that folds into one on a parser that decodes twice. The
+  // canonical %2f was already caught, and enumerating the rest does not end --
+  // so the rule is what the decode does, and none of these decodes at all.
+  const refused = [
+    '/api/status/..%c0%afenv%c0%afreveal',
+    '/api/status/..%e0%80%afenv',
+    '/api/status/%%32%66..',
+  ];
+  for (const path of refused) {
+    const response = await rawGet(proxy.port, path, identified());
+    assert.equal(response.status, 400, `${path} must be refused`);
+  }
+  assert.equal(hermes.requests.length, 0, 'nothing may be forwarded');
+
+  // The guard has to stay this targeted. "Refuse all percent-encoding" would
+  // have taken a space in a session name with it.
+  const named = await rawGet(proxy.port, '/api/sessions/my%20session', identified());
+  assert.equal(named.status, 200);
+  assert.equal(hermes.requests[0].url, '/api/sessions/my%20session', '%20 must arrive intact');
+});
+
+test('the read exclusions survive a trailing slash, case and an encoded letter', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // Every one of these routes to trigger by the time upstream reads it, and
+  // every one used to pass as an ordinary read under the /api/cron/jobs prefix
+  // -- unlimited and unaudited, which is the whole reason the exclusion exists.
+  const paths = [
+    '/api/cron/jobs/x/trigger/',
+    '/api/cron/jobs/x/TRIGGER',
+    '/api/cron/jobs/x/%74rigger',
+  ];
+  for (const path of paths) {
+    const response = await rawGet(proxy.port, path, identified());
+    assert.equal(response.status, 404, `GET ${path} must not read as a read`);
+  }
+  assert.equal(hermes.requests.length, 0);
+
+  // The exclusion is about the method, not the route.
+  const write = await rawRequest(proxy.port, 'POST', '/api/cron/jobs/x/trigger', identified());
+  assert.equal(write.status, 200, 'the real action must not have been excluded too');
+  assert.equal(hermes.requests.length, 1);
+});
+
+test('the whole of 127.0.0.0/8 is loopback, and a Host may carry the DNS root dot', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // False negatives, and a false negative in an allowlist looks like a broken
+  // app rather than like a policy. A fronting proxy sourcing from 127.0.0.2 and
+  // the fully qualified spelling of a MagicDNS name are both correct
+  // deployments; the v4-mapped form is here because the URL parser rewrites it
+  // to [::ffff:7f00:1], a spelling no literal set was ever going to match.
+  const served = ['node.tail1.ts.net.', '[::ffff:127.0.0.1]', `127.0.0.2:${proxy.port}`];
+  for (const host of served) {
+    const response = await rawGet(proxy.port, '/api/status', identified({ Host: host }));
+    assert.equal(response.status, 200, `${host} must be served`);
+  }
+  assert.equal(hermes.requests.length, served.length, 'every allowed host must reach Hermes');
+
+  // And nothing was loosened on the way past: a name the attacker owns, a
+  // substring of the tailnet zone, and a private-range address stay refused.
+  for (const host of ['evil.example.com', 'notts.net', '192.168.1.1']) {
+    const response = await rawGet(proxy.port, '/api/status', identified({ Host: host }));
+    assert.equal(response.status, 421, `${host} must not be served`);
+  }
+  assert.equal(hermes.requests.length, served.length, 'and none of those reached Hermes');
+});
+
+test('a push write is metered like an action that reaches the agent', async (t) => {
+  const { proxy } = await proxyFor(t, { env: { ...strictEnv, HERMES_MOBILE_WRITE_LIMIT: '1' } });
+
+  // /push/* is served here rather than forwarded, so it sat outside the budget
+  // entirely -- but each accepted subscribe is a synchronous write plus a chmod
+  // on the host, and a reader who saw /push named alongside /api in the
+  // identity gate would reasonably assume the budget covered it. The meter runs
+  // before the body is read, so what the endpoint makes of the body is beside
+  // the point.
+  const body = { endpoint: 'https://push.example/abc' };
+  const first = await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(), body);
+  const second = await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(), body);
+
+  assert.notEqual(first.status, 429, 'the first write is within the budget');
+  assert.equal(second.status, 429);
+  assert.equal(second.headers['retry-after'], '60');
+});
+
+test('an accepted push write is recorded with the identity that made it', async (t) => {
+  const { proxy } = await proxyFor(t, { env: strictEnv });
+
+  await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(), {
+    endpoint: 'https://push.example/abc',
+  });
+  // Give the child a moment to flush its stdout.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const lines = proxy
+    .stdout()
+    .split('\n')
+    .filter((line) => line.includes('"audit"'))
+    .map((line) => JSON.parse(line));
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].audit, 'write');
+  assert.equal(lines[0].login, IDENTITY);
+  assert.equal(lines[0].method, 'POST');
+  assert.equal(lines[0].path, '/push/subscribe');
+});
+
+test('a push read is not metered', async (t) => {
+  const { proxy } = await proxyFor(t, { env: { ...strictEnv, HERMES_MOBILE_WRITE_LIMIT: '1' } });
+
+  // The browser asks for the VAPID key on every load. Reads were never the loop
+  // the budget exists to bound.
+  for (let i = 0; i < 4; i += 1) {
+    const response = await rawGet(proxy.port, '/push/config', identified());
+    assert.equal(response.status, 200, 'a push read must not spend the write budget');
+  }
+});

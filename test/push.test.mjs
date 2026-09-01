@@ -107,6 +107,15 @@ const REJECTED = {
   'unique local IPv6': 'https://[fd00::1]/x',
   'not a URL at all': 'not-a-url',
   'an over-long endpoint': `https://push.example/${'a'.repeat(2100)}`,
+  // A trailing dot is the DNS root label, and `localhost.` resolves exactly
+  // like `localhost`. The URL parser keeps it on a name (it strips it from a
+  // dotted quad), so without normalising it one character walked past the
+  // whole internal-host rule.
+  'loopback with a root dot': 'https://localhost./x',
+  'loopback with a root dot and a port': 'https://localhost.:8443/x',
+  'a subdomain of localhost with a root dot': 'https://x.localhost./x',
+  'a run of root dots': 'https://localhost../x',
+  'nothing but a root label': 'https://./x',
 };
 
 test('the endpoint rule accepts public HTTPS and nothing else', () => {
@@ -120,6 +129,9 @@ test('the endpoint rule accepts public HTTPS and nothing else', () => {
   // numeric checks see the canonical form rather than the text the caller sent.
   assert.equal(isDeliverableEndpoint('https://2130706433/x').ok, false);
   assert.equal(isDeliverableEndpoint('https://sub.localhost/x').ok, false);
+  // Stripping the root label is normalisation, not a rule of its own: a public
+  // name with a trailing dot is the same public name and is still deliverable.
+  assert.equal(isDeliverableEndpoint('https://fcm.googleapis.com./fcm/send/abc').ok, true);
 });
 
 test('only deliverable endpoints are persisted', async (t) => {
@@ -214,6 +226,100 @@ test('a subscription can only be removed by the identity that created it', async
   });
   assert.equal(owner.status, 204);
   assert.doesNotMatch(readFileSync(statePath, 'utf8'), /fcm\/send\/owned/);
+});
+
+// Scoping unsubscribe to the owner is not enough on its own: addSubscription
+// replaced any entry with a matching endpoint regardless of who held it, so a
+// second identity could take a subscription over and then legitimately remove
+// it. Even stopping at the takeover is harmful -- garbage keys fail every
+// delivery with a status that is not 404/410, so the owner's alerts stop with
+// nothing to show for it.
+test('a subscription cannot be taken over by re-subscribing to its endpoint', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({
+    env: {
+      ...withVapid(stateDir),
+      HERMES_MOBILE_ALLOWED_LOGINS: `${OWNER},${STRANGER}`,
+      HERMES_MOBILE_ALLOW_LOCAL: '',
+    },
+  });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/contested';
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = () => JSON.parse(readFileSync(statePath, 'utf8')).subscriptions;
+
+  assert.equal(
+    (
+      await rawRequest(
+        proxy.port,
+        'POST',
+        '/push/subscribe',
+        identified(OWNER),
+        subscription(endpoint),
+      )
+    ).status,
+    204,
+  );
+  const mine = stored()[0];
+
+  const takeover = await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(STRANGER), {
+    endpoint,
+    keys: { p256dh: 'ZZZ', auth: 'ZZZ' },
+  });
+  // 204, the same as success: saying "that endpoint is held by someone else"
+  // would answer a question the caller has no business asking.
+  assert.equal(takeover.status, 204);
+
+  const after = stored();
+  assert.equal(after.length, 1, 'no second entry for the same endpoint');
+  assert.equal(after[0].owner, mine.owner, 'ownership is unchanged');
+  assert.deepEqual(after[0].keys, mine.keys, "the owner's keys are untouched");
+
+  const evict = await rawRequest(proxy.port, 'POST', '/push/unsubscribe', identified(STRANGER), {
+    endpoint,
+  });
+  assert.equal(evict.status, 204);
+  assert.equal(stored().length, 1, 'and it still cannot be removed by a stranger');
+});
+
+// The counterweight. Browsers re-POST their subscription on every load, and the
+// keys rotate, so refusing a same-owner replacement would silently stop push.
+test('an identity can re-subscribe its own endpoint with rotated keys', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({
+    env: {
+      ...withVapid(stateDir),
+      HERMES_MOBILE_ALLOWED_LOGINS: OWNER,
+      HERMES_MOBILE_ALLOW_LOCAL: '',
+    },
+  });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/rotating';
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = () => JSON.parse(readFileSync(statePath, 'utf8')).subscriptions;
+
+  await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    identified(OWNER),
+    subscription(endpoint),
+  );
+  const rotated = {
+    ...subscription(endpoint),
+    keys: { ...subscription(endpoint).keys, auth: 'Xn9pQr2sTuVwXyZ0AbCdEg' },
+  };
+  assert.equal(
+    (await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(OWNER), rotated)).status,
+    204,
+  );
+
+  const after = stored();
+  assert.equal(after.length, 1, 'still one entry, not two');
+  assert.equal(after[0].keys.auth, 'Xn9pQr2sTuVwXyZ0AbCdEg', 'the new keys took effect');
+  assert.equal(after[0].owner, OWNER, 'and it is still theirs');
 });
 
 test('the state file and its directory stay owner-only after a rewrite', async (t) => {
@@ -396,4 +502,74 @@ test('a paused job is not treated as a failure', async (t) => {
   ]);
   await notifications.poll();
   assert.equal(sent.length, 0);
+});
+
+// A subscription that keeps failing used to be kept forever: only 404 and 410
+// reaped one, and every other status was treated as transient. So an endpoint
+// that had started answering 500 was retried on every tick for the life of the
+// process, logging an error each time and burying the alerts that matter. One
+// failure is still not a verdict; ten in a row is, and a success in between
+// resets the count so a blip cannot accumulate.
+test('a subscription that fails persistently is eventually given up on', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([{ id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z' }]);
+  t.after(() => cron.stop());
+
+  let failing = true;
+  let attempts = 0;
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver: async () => {
+      attempts += 1;
+      // 500 is the "might be a blip" class. 404/410 reap immediately and are
+      // covered elsewhere; this is the status that used to be kept forever.
+      if (failing) throw Object.assign(new Error('upstream refused'), { statusCode: 500 });
+    },
+  });
+  notifications.addSubscription(subscription('https://push.example/flaky'), 'owner@example.com');
+
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = () => JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.length;
+
+  // Each poll must see a *newly* failed job to send anything, so give it one.
+  let tick = 0;
+  const failJobOnce = async () => {
+    tick += 1;
+    cron.set([
+      {
+        id: 'a',
+        name: 'Job A',
+        last_run_at: `2026-01-01T00:00:${String(tick).padStart(2, '0')}Z`,
+        last_status: 'error',
+        last_error: `boom ${tick}`,
+      },
+    ]);
+    await notifications.poll();
+  };
+
+  await notifications.poll(); // seeding pass: never replays existing state
+  for (let i = 0; i < 9; i += 1) await failJobOnce();
+  assert.equal(stored(), 1, 'nine consecutive failures is not a verdict');
+
+  failing = false;
+  await failJobOnce();
+  failing = true;
+  for (let i = 0; i < 9; i += 1) await failJobOnce();
+  assert.equal(stored(), 1, 'a successful delivery must reset the streak');
+
+  await failJobOnce();
+  assert.equal(stored(), 0, 'the tenth consecutive failure should drop it');
+
+  const before = attempts;
+  await failJobOnce();
+  assert.equal(attempts, before, 'a dropped subscription is not retried');
 });

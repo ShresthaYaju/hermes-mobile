@@ -109,7 +109,6 @@ test('allowlisted read endpoints are forwarded upstream', async (t) => {
     '/api/profiles/sessions/sidebar',
     '/api/cron/jobs',
     '/api/cron/jobs/9be8b1662fb0/runs',
-    '/api/analytics/usage',
   ];
   for (const path of paths) {
     const response = await rawGet(proxy.port, path);
@@ -119,6 +118,32 @@ test('allowlisted read endpoints are forwarded upstream', async (t) => {
     hermes.requests.map((r) => r.url),
     paths,
   );
+});
+
+// A read prefix that no view calls is reach this app grants and never uses.
+// These four were allowed by prefix and referenced nowhere under public/;
+// /api/logs was the sharp one, since upstream answers it with thousands of
+// lines of agent log, prompts and tool output included. If a view ever needs
+// one back, it comes back with the view, not before it.
+test('read prefixes no view calls are not exposed', async (t) => {
+  const hermes = await startFakeHermes();
+  const proxy = await startProxy({ hermesOrigin: hermes.origin });
+  t.after(async () => {
+    await proxy.stop();
+    await hermes.stop();
+  });
+
+  for (const path of [
+    '/api/logs',
+    '/api/logs/hermes.log',
+    '/api/analytics/usage',
+    '/api/cron/blueprints',
+    '/api/cron/delivery-targets',
+  ]) {
+    const response = await rawGet(proxy.port, path);
+    assert.equal(response.status, 404, `${path} should be refused`);
+  }
+  assert.deepEqual(hermes.requests, [], 'nothing should have reached Hermes');
 });
 
 // The backend serves its whole dashboard API on this port, including secrets
