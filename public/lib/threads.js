@@ -3,8 +3,8 @@
 // The rule is ownership, and it is a correctness rule rather than a policy
 // one. Event fan-out is per-session-transport: the gateway addresses events to
 // whichever transport last touched a session, with no subscribe and no
-// broadcast. Two consequences, both verified during the Phase 3 spikes and
-// recorded in PLAN.md:
+// broadcast. Two consequences, both verified by spiking against a live
+// backend and recorded in docs/DESIGN-NOTES.md:
 //
 //   * Telegram and cron sessions belong to the separate hermes-gateway
 //     process. Calling session.resume on one from here cold-loads its history
