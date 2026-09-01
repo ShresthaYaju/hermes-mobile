@@ -1,0 +1,77 @@
+name: Bug report
+description: Something behaves differently from how it is documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **If this is a security problem, stop.** Do not file it here — use a
+        [private advisory](https://github.com/ShresthaYaju/hermes-mobile/security/advisories/new)
+        instead. See [SECURITY.md](https://github.com/ShresthaYaju/hermes-mobile/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >-
+        Exact steps. If it involves a request, a `curl` line is ideal. If it is
+        a UI problem, say which tab and what you tapped.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >-
+        `journalctl --user -u hermes-mobile-pwa.service -n 50`, or the browser
+        console. **Redact any token, VAPID key, tailnet name or login** before
+        pasting — the audit lines contain identities.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      description: Output of `node -v`. The project requires 22 or newer.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: How are you reaching it?
+      options:
+        - Through tailscale serve, from a phone
+        - Through tailscale serve, from a desktop browser
+        - Locally on the host (HERMES_MOBILE_ALLOW_LOCAL=1)
+        - Some other way (please describe above)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I ran `npm test` on this commit and noted whether it passes.
+        - label: I have redacted tokens, keys, logins and tailnet names from everything above.

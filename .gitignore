@@ -1,8 +1,33 @@
+# Dependencies
 node_modules/
-.env
-npm-debug.log*
-.DS_Store
 
-# Working notes: contains local paths, profile names and live session detail.
+# Secrets. The service env file lives in ~/.config and must never land here,
+# but ignore the usual names anyway -- this repo fronts an agent with shell
+# access, so a leaked token is not a papercut.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+hermes-mobile-pwa.env
+
+# Runtime state. Push subscription endpoints are capability URLs.
+subscriptions.json
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Local working notes: contain local paths, profile names and live session
+# detail. Design decisions worth keeping are written up in docs/ instead.
 PLAN.md
 AUDIT.md
+NOTES.md
+scratch/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
