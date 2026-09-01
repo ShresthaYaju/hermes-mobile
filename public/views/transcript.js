@@ -3,7 +3,7 @@
 // Rendering lives in lib/transcript.js because the chat view replays the same
 // stored history above its composer. This view is the read-only door: it never
 // attaches to a session, so opening one can never steal another transport's
-// event stream (PLAN.md, spike 2).
+// event stream (docs/DESIGN-NOTES.md, spike 2).
 
 import { api } from '../lib/api.js';
 import { el, clear, spinner, errorState, emptyState, sourceGlyph } from '../lib/ui.js';

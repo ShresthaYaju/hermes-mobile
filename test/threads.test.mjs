@@ -5,7 +5,7 @@
 // session another process owns (Telegram, cron) builds a SECOND agent against
 // the same transcript, and resuming one another transport holds (the desktop
 // dashboard's web-pwa chats) silently redirects its events. Both were verified
-// in the Phase 3 spikes; see PLAN.md.
+// by spiking against a live backend; see docs/DESIGN-NOTES.md.
 //
 // This suite pins the rule that keeps us out of that: only sessions this app
 // created open in the composer, everything else opens read-only.
