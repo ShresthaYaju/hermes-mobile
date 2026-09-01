@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ShresthaYaju/hermes-mobile/security/advisories/new
+    about: >-
+      Do NOT open a public issue. This app fronts an agent that can run shell
+      commands, so report anything security-relevant privately here.
+  - name: Question or idea
+    url: https://github.com/ShresthaYaju/hermes-mobile/discussions
+    about: Ask a question or float an idea before building it.

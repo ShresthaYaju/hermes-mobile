@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest something this should do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth reading [CONTRIBUTING.md](https://github.com/ShresthaYaju/hermes-mobile/blob/main/CONTRIBUTING.md)
+        first — it lists things that are deliberately not being built, and why.
+        Notably: no bundler or framework, and no writing into Telegram or cron
+        threads from this app.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >-
+        The problem, not the solution. What does the app make hard or
+        impossible right now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What do you have in mind?
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Does this widen what the app can reach?
+      description: >-
+        Anything that adds a proxied route, an upload surface, or a new RPC
+        method changes the security boundary. If yours does, say so — it does
+        not disqualify the idea, it just means it needs deciding deliberately.

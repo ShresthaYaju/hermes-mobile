@@ -1,7 +1,27 @@
+# Hermes Agent's headless JSON-RPC backend, which hermes-mobile proxies to.
+#
+# PATHS: ExecStart assumes `hermes` is at ~/.local/bin/hermes. Check `which
+# hermes` and edit if yours is elsewhere, or systemd fails with 203/EXEC.
+#
+# WHY THIS UNIT IS NOT SANDBOXED, unlike hermes-mobile-pwa.service:
+# this process *is* the agent. Its purpose is running arbitrary commands and
+# writing arbitrary files on your behalf, so ProtectSystem=strict, ProtectHome
+# or a syscall filter would not harden it -- they would stop it working. There
+# is no confinement to add here that the agent would survive.
+#
+# That means the sandboxing on the proxy unit bounds the proxy, and nothing
+# bounds this. If you want the agent's blast radius reduced, the place to do it
+# is Hermes Agent's own terminal backend (`terminal.backend`), not here.
+
 [Unit]
 Description=Hermes headless JSON-RPC backend for Hermes Mobile PWA
 After=network-online.target
 Wants=network-online.target
+
+# Do not let a crash loop burn into a permanently failed state that survives
+# reboot and needs `systemctl --user reset-failed` to clear.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple

@@ -2,8 +2,40 @@
   "name": "hermes-mobile",
   "version": "0.1.0",
   "private": true,
-  "description": "A Tailscale-only installable mobile control surface for Hermes Agent.",
+  "description": "An installable, tailnet-only mobile control surface for Hermes Agent.",
+  "keywords": [
+    "hermes",
+    "hermes-agent",
+    "pwa",
+    "tailscale",
+    "tailnet",
+    "ai-agent",
+    "self-hosted",
+    "mobile",
+    "web-push"
+  ],
+  "homepage": "https://github.com/ShresthaYaju/hermes-mobile#readme",
+  "bugs": {
+    "url": "https://github.com/ShresthaYaju/hermes-mobile/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShresthaYaju/hermes-mobile.git"
+  },
+  "license": "MIT",
+  "author": "Yaju Shrestha",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "public",
+    "systemd",
+    "server.mjs",
+    "notifications.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test 'test/*.test.mjs'",
