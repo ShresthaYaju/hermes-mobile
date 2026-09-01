@@ -118,6 +118,7 @@ repository.
 | `HERMES_MOBILE_IDENTITY_DEBUG` | off | `1` makes a refusal name the identity it saw. Useful exactly once, when first wiring this up. |
 | `HERMES_MOBILE_ALLOWED_ORIGINS` | *(none)* | Extra browser origins permitted, comma separated. Only needed when the app is served from one hostname and reached by another. |
 | `HERMES_MOBILE_ALLOWED_HOSTS` | loopback, `*.ts.net`, `100.64.0.0/10` | Extra `Host` values this proxy will answer for, comma separated. The defaults cover local use and `tailscale serve`; you need this only if you front the app with some other name. |
+| `HERMES_MOBILE_READ_TIMEOUT` | `30000` | Milliseconds a read waits on Hermes before giving up, answering 502. Reads only: a write can legitimately run the agent for minutes, and the WebSocket is long-lived by design. `0` waits forever. |
 | `HERMES_MOBILE_WRITE_LIMIT` | `30` | Writes allowed per identity per minute. `0` refuses writes entirely. A value that does not parse as a number refuses to start rather than silently becoming one write per minute. |
 | `HERMES_MOBILE_STATE_DIR` | `$XDG_STATE_HOME/hermes-mobile`, else `~/.local/state/hermes-mobile` | Where the push subscription file is kept. Written `0600`. |
 | `HERMES_MOBILE_ALLOW_PUBLIC_BIND` | off | `1` overrides the refusal to bind a non-loopback address. **Do not set this** unless you have put real authentication in front of the app; see [SECURITY.md](SECURITY.md). Note that the identity header is still refused off a non-loopback socket, so a fronting proxy has to run on this same host. |
@@ -202,7 +203,7 @@ tailscale serve reset
 ### Known limitations
 
 - **The REST allowlist does not constrain the JSON-RPC gateway.** `/api/ws` exposes the full method surface, `shell.exec` included. The identity gate, the same-origin check and the tailnet are what protect it; the careful REST allowlist is a second layer, not the primary one. Anyone you allowlist has, in effect, a shell. This is deliberate — [`docs/DESIGN-NOTES.md`](docs/DESIGN-NOTES.md) explains why an RPC method allowlist was considered and rejected.
-- **No request timeouts on the proxy.** A slow or hung upstream is not bounded, beyond Node's own defaults.
+- **Only reads are bounded against a hung upstream** (`HERMES_MOBILE_READ_TIMEOUT`, default 30s). Writes are not, because a write can legitimately run the agent for minutes and cutting it off would abandon work still running upstream; the WebSocket is long-lived by definition. Node's own `headersTimeout` and `requestTimeout` defaults apply to the inbound side.
 - **The identity header is trusted, not verified.** Nothing cryptographically binds it to a tailnet user; the guarantee comes from `tailscale serve` injecting it and stripping client copies, and from this proxy refusing it off a non-loopback socket. If you put a different reverse proxy in front, it must be on the same host and it must strip that header itself.
 - **The agent's shell is not sandboxed.** `terminal.backend = local` runs it as the host user. That is the blast radius behind every item above, and the highest-leverage thing to change — but it lives in Hermes Agent, not here.
 - **Approvals raised while the phone is asleep cannot be recovered.** No REST or RPC surface lists a session's pending approvals. The turn itself survives; the prompt is not re-shown. Closing this needs a change upstream.

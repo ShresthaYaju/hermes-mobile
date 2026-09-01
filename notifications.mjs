@@ -143,12 +143,39 @@ function isInternalHost(hostname) {
   if (!words) return true;
   if (words.every((word) => word === 0)) return true;
   if (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true;
-  // ::ffff:a.b.c.d and the deprecated ::a.b.c.d both wrap a v4 address.
-  if (words.slice(0, 5).every((word) => word === 0) && (words[5] === 0xffff || words[5] === 0)) {
-    return isInternalIpv4([words[6] >> 8, words[6] & 0xff, words[7] >> 8, words[7] & 0xff]);
-  }
+  // Several IPv6 forms carry an IPv4 address inside them, and on a host with
+  // the matching transition mechanism configured they reach that address. So
+  // wherever a v4 address is embedded, unwrap it and apply the v4 rules --
+  // otherwise `[64:ff9b::7f00:1]` is a spelling of 127.0.0.1 that walks past
+  // every check above.
+  const embedded = embeddedIpv4(words);
+  if (embedded) return isInternalIpv4(embedded);
+
   if ((words[0] & 0xfe00) === 0xfc00) return true; // fc00::/7, unique local
-  return (words[0] & 0xffc0) === 0xfe80; // fe80::/10, link local
+  if ((words[0] & 0xffc0) === 0xfe80) return true; // fe80::/10, link local
+  return (words[0] & 0xffc0) === 0xfec0; // fec0::/10, deprecated site local
+}
+
+/** Big-endian octets of the IPv4 address an IPv6 literal embeds, or null. */
+function embeddedIpv4(words) {
+  const quad = (high, low) => [high >> 8, high & 0xff, low >> 8, low & 0xff];
+
+  // ::ffff:a.b.c.d (v4-mapped) and the deprecated ::a.b.c.d (v4-compatible).
+  if (words.slice(0, 5).every((word) => word === 0) && (words[5] === 0xffff || words[5] === 0)) {
+    return quad(words[6], words[7]);
+  }
+  // ::ffff:0:a.b.c.d -- v4-translated, one word further left than v4-mapped.
+  if (words.slice(0, 4).every((word) => word === 0) && words[4] === 0xffff && words[5] === 0) {
+    return quad(words[6], words[7]);
+  }
+  // 2002:a.b.c.d::/16 -- 6to4 puts the address immediately after the prefix.
+  if (words[0] === 0x2002) return quad(words[1], words[2]);
+  // 64:ff9b::a.b.c.d -- the well-known NAT64 prefix, which is the one of these
+  // still in live use: on a NAT64 network this really is translated.
+  if (words[0] === 0x0064 && words[1] === 0xff9b && words.slice(2, 6).every((w) => w === 0)) {
+    return quad(words[6], words[7]);
+  }
+  return null;
 }
 
 /**

@@ -170,6 +170,17 @@ function identify(request) {
 // read as a deliberate lockout and look exactly like the app being broken.
 const configuredWriteLimit = (process.env.HERMES_MOBILE_WRITE_LIMIT ?? '').trim();
 const WRITE_LIMIT = configuredWriteLimit === '' ? 30 : Number(configuredWriteLimit);
+
+// How long to wait on Hermes for a read before giving up, in milliseconds.
+//
+// Reads only, and deliberately. A write can legitimately take minutes --
+// POST /api/cron/jobs/{id}/trigger runs the agent, and cutting that off at a
+// timeout would abort work the caller asked for while leaving it running
+// upstream. The WebSocket is long-lived by definition. Reads are the polls the
+// app makes constantly, so an upstream that stops answering is exactly where an
+// unbounded wait piles them up behind a backend that is never coming back.
+const configuredReadTimeout = (process.env.HERMES_MOBILE_READ_TIMEOUT ?? '').trim();
+const READ_TIMEOUT_MS = configuredReadTimeout === '' ? 30_000 : Number(configuredReadTimeout);
 const WRITE_WINDOW_MS = 60_000;
 const writeBudget = new Map();
 
@@ -647,7 +658,8 @@ const server = http.createServer((request, response) => {
     // but it makes "authorized path == forwarded path" a property of this file
     // rather than of a dependency's internals, which is where it belongs.
     request.url = `${url.pathname}${url.search}`;
-    proxy.web(request, response);
+    const bounded = !write && READ_TIMEOUT_MS > 0;
+    proxy.web(request, response, bounded ? { proxyTimeout: READ_TIMEOUT_MS } : {});
     return;
   }
 
@@ -762,6 +774,19 @@ server.on('upgrade', (request, socket, head) => {
  * open to every peer on the tailnet, which is the exact failure the identity
  * gate exists to prevent. Refuse, the same way a non-loopback bind is refused.
  */
+if (!Number.isInteger(READ_TIMEOUT_MS) || READ_TIMEOUT_MS < 0) {
+  console.error(
+    [
+      `Refusing to start: HERMES_MOBILE_READ_TIMEOUT=${configuredReadTimeout} is not a whole`,
+      'number of milliseconds.',
+      '',
+      'It bounds how long a read waits on Hermes before giving up. Use 0 to wait',
+      'forever, or leave it unset for the default of 30000.',
+    ].join('\n'),
+  );
+  process.exit(1);
+}
+
 if (!Number.isInteger(WRITE_LIMIT) || WRITE_LIMIT < 0) {
   console.error(
     [
