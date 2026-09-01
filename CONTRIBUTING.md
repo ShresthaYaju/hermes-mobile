@@ -32,7 +32,7 @@ git clone https://github.com/ShresthaYaju/hermes-mobile.git
 cd hermes-mobile
 npm ci
 npm run check   # syntax check + prettier
-npm test        # 125 tests, spawns the real server on ephemeral ports
+npm test        # spawns the real server on ephemeral ports
 ```
 
 The test suite does **not** need a running Hermes Agent — it starts the real
@@ -70,8 +70,16 @@ failures that every other test would sail straight past:
 - `test/pwa.test.mjs` — **adding a file to `public/lib/` or `public/views/`
   means adding it to `ASSETS` in `public/service-worker.js`.** This test fails
   if you forget.
-- `test/identity.test.mjs`, `test/origin.test.mjs`, `test/writes.test.mjs` —
-  the security controls. Treat these as the specification.
+- `test/identity.test.mjs`, `test/origin.test.mjs`, `test/writes.test.mjs`,
+  `test/hardening.test.mjs` — the security controls. Treat these as the
+  specification. `hardening.test.mjs` in particular pins fixes for real
+  vulnerabilities (DNS rebinding past the same-origin check, the WebSocket
+  upgrade accepting any `/api/*` path with the session token attached, encoded
+  path separators slipping past the REST allowlist). Each of its tests fails if
+  the corresponding guard is removed — that is the bar for adding to it. It
+  asserts on what reached the upstream, not just on status codes, because a
+  test that checks the status while letting the request through is a test that
+  would not have caught the original bug.
 - `test/threads.test.mjs` — the session-ownership rule (below). Not a style
   preference; a correctness one.
 - The suite is DOM-free by design. It tests the server for real and the client

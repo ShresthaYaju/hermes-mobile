@@ -117,9 +117,10 @@ repository.
 | `HERMES_MOBILE_ALLOW_LOCAL` | off | `1` additionally admits callers presenting no identity at all. Those cannot have come through Serve, so in practice this means the host itself — local `curl`, the test suite. |
 | `HERMES_MOBILE_IDENTITY_DEBUG` | off | `1` makes a refusal name the identity it saw. Useful exactly once, when first wiring this up. |
 | `HERMES_MOBILE_ALLOWED_ORIGINS` | *(none)* | Extra browser origins permitted, comma separated. Only needed when the app is served from one hostname and reached by another. |
-| `HERMES_MOBILE_WRITE_LIMIT` | `30` | Writes allowed per identity per minute. `0` or less disables the limit. |
+| `HERMES_MOBILE_ALLOWED_HOSTS` | loopback, `*.ts.net`, `100.64.0.0/10` | Extra `Host` values this proxy will answer for, comma separated. The defaults cover local use and `tailscale serve`; you need this only if you front the app with some other name. |
+| `HERMES_MOBILE_WRITE_LIMIT` | `30` | Writes allowed per identity per minute. `0` refuses writes entirely. A value that does not parse as a number refuses to start rather than silently becoming one write per minute. |
 | `HERMES_MOBILE_STATE_DIR` | `$XDG_STATE_HOME/hermes-mobile`, else `~/.local/state/hermes-mobile` | Where the push subscription file is kept. Written `0600`. |
-| `HERMES_MOBILE_ALLOW_PUBLIC_BIND` | off | `1` overrides the refusal to bind a non-loopback address. **Do not set this** unless you have put real authentication in front of the app; see [SECURITY.md](SECURITY.md). |
+| `HERMES_MOBILE_ALLOW_PUBLIC_BIND` | off | `1` overrides the refusal to bind a non-loopback address. **Do not set this** unless you have put real authentication in front of the app; see [SECURITY.md](SECURITY.md). Note that the identity header is still refused off a non-loopback socket, so a fronting proxy has to run on this same host. |
 | `HERMES_MOBILE_VAPID_PUBLIC_KEY` | *(none)* | Web Push. Absent, push is off and Config says so. |
 | `HERMES_MOBILE_VAPID_PRIVATE_KEY` | *(none)* | Web Push. Keep it in the `0600` env file and nowhere else. |
 | `HERMES_MOBILE_VAPID_SUBJECT` | *(none)* | Web Push contact, e.g. `mailto:you@example.com`. |
@@ -172,6 +173,10 @@ tailscale serve reset
 
 - **Actions that reach the agent are rate limited and recorded.** Writes are capped per identity per minute (`HERMES_MOBILE_WRITE_LIMIT`, default 30) so nothing can sit in a loop on `POST /api/cron/jobs/{id}/trigger`, which runs the agent every time. Each accepted or rate-limited write is written to stdout as a JSON audit line carrying the identity, method and path. Reads are neither limited nor audited: they cannot run the agent, and one line per poll would bury the entries that matter.
 
+- **The proxy only answers for hosts it expects.** Same-origin compares `Origin` against the `Host` header — and DNS rebinding controls both, so a name the attacker owns, pointed at `127.0.0.1`, makes the two agree by construction and the check passes. So the `Host` is checked against an allowlist of its own before same-origin runs: loopback, the `*.ts.net` MagicDNS name `tailscale serve` presents, and the `100.64.0.0/10` tailnet range, plus anything in `HERMES_MOBILE_ALLOWED_HOSTS`. Anything else gets a 421. This is what stops a web page you happen to visit from reaching the JSON-RPC socket on your own machine — which mattered most with `HERMES_MOBILE_ALLOW_LOCAL=1` set, since then no identity is required either.
+
+- **The identity header is only believed from a loopback peer.** `Tailscale-User-Login` is trusted verbatim, so it is worth exactly as much as the claim that Serve put it there. Serve proxies from the machine itself. A request arriving from anywhere else means something other than Serve is in front, and the header is then just a string the caller typed — so it is refused rather than believed. Encoded path separators (`%2f`, `%5c`, `%2e`) are refused for the same class of reason: the allowlist matches a normalized path, and forwarding a raw one would let the upstream's parser, not this proxy, decide what was authorized.
+
 - **Every `/api` and `/push` request must be same-origin.** A browser sets `Origin` itself and a page cannot forge or suppress it, so the proxy requires `Origin`'s host to match the `Host` it was reached by, and refuses `null`. This is the control that stops a hostile web page from driving the agent, and it matters most for WebSockets: they are exempt from CORS entirely, so nothing in the browser would have stopped the upgrade. A request with no `Origin` at all is not from a browser (curl, native clients) and is allowed — those are stopped by the identity gate instead. Set `HERMES_MOBILE_ALLOWED_ORIGINS` to permit additional origins.
 
 - No model credentials or Hermes tokens are stored in this repository or sent to the browser. The loopback credential lives only in `~/.config/hermes-mobile-pwa.env` (mode `0600`) and the proxy adds it on the internal hop, to both the WebSocket upgrade and each REST call.
@@ -195,7 +200,8 @@ tailscale serve reset
 ### Known limitations
 
 - **The REST allowlist does not constrain the JSON-RPC gateway.** `/api/ws` exposes the full method surface, `shell.exec` included. The identity gate, the same-origin check and the tailnet are what protect it; the careful REST allowlist is a second layer, not the primary one. Anyone you allowlist has, in effect, a shell. This is deliberate — [`docs/DESIGN-NOTES.md`](docs/DESIGN-NOTES.md) explains why an RPC method allowlist was considered and rejected.
-- **No request timeouts on the proxy.** A slow or hung upstream is not bounded.
+- **No request timeouts on the proxy.** A slow or hung upstream is not bounded, beyond Node's own defaults.
+- **The identity header is trusted, not verified.** Nothing cryptographically binds it to a tailnet user; the guarantee comes from `tailscale serve` injecting it and stripping client copies, and from this proxy refusing it off a non-loopback socket. If you put a different reverse proxy in front, it must be on the same host and it must strip that header itself.
 - **The agent's shell is not sandboxed.** `terminal.backend = local` runs it as the host user. That is the blast radius behind every item above, and the highest-leverage thing to change — but it lives in Hermes Agent, not here.
 - **Approvals raised while the phone is asleep cannot be recovered.** No REST or RPC surface lists a session's pending approvals. The turn itself survives; the prompt is not re-shown. Closing this needs a change upstream.
 

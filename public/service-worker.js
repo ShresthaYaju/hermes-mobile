@@ -110,13 +110,27 @@ self.addEventListener('push', (event) => {
   );
 });
 
+function sameOriginTarget(url) {
+  const fallback = '/#/work';
+  if (typeof url !== 'string' || !url) return fallback;
+  try {
+    const resolved = new URL(url, self.location.origin);
+    return resolved.origin === self.location.origin ? resolved.href : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = event.notification.data?.url || '/#/work';
+  // The payload is encrypted to this host's VAPID keys, so a hostile url here
+  // means the keys are already gone -- but a notification click should not be
+  // able to navigate the app off-origin regardless of who is sending.
+  const target = sameOriginTarget(event.notification.data?.url);
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
       for (const client of clients) {
-        if (client.url.includes(self.location.origin)) {
+        if (client.url.startsWith(self.location.origin)) {
           client.navigate(target).catch(() => {});
           return client.focus();
         }
