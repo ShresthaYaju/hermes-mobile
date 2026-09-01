@@ -116,6 +116,16 @@ const REJECTED = {
   'a subdomain of localhost with a root dot': 'https://x.localhost./x',
   'a run of root dots': 'https://localhost../x',
   'nothing but a root label': 'https://./x',
+  // Several IPv6 forms carry an IPv4 address inside them, and on a host with
+  // the matching transition mechanism configured they reach it. NAT64 is the
+  // one still in live use; the rest are cheap to cover and would otherwise be
+  // spellings of 127.0.0.1 that walk past every other rule.
+  'a NAT64-wrapped loopback': 'https://[64:ff9b::7f00:1]/x',
+  'a NAT64-wrapped private address': 'https://[64:ff9b::a00:1]/x',
+  'a 6to4-wrapped loopback': 'https://[2002:7f00:1::]/x',
+  'a 6to4-wrapped tailnet address': 'https://[2002:6440:101::]/x',
+  'an IPv4-translated loopback': 'https://[::ffff:0:127.0.0.1]/x',
+  'deprecated site-local IPv6': 'https://[fec0::1]/x',
 };
 
 test('the endpoint rule accepts public HTTPS and nothing else', () => {
@@ -132,6 +142,11 @@ test('the endpoint rule accepts public HTTPS and nothing else', () => {
   // Stripping the root label is normalisation, not a rule of its own: a public
   // name with a trailing dot is the same public name and is still deliverable.
   assert.equal(isDeliverableEndpoint('https://fcm.googleapis.com./fcm/send/abc').ok, true);
+  // Unwrapping an embedded IPv4 must judge the address, not the wrapper: a
+  // transition form around a *public* address is still perfectly deliverable.
+  assert.equal(isDeliverableEndpoint('https://[2002:0808:0808::]/x').ok, true);
+  assert.equal(isDeliverableEndpoint('https://[::1.2.3.4]/x').ok, true);
+  assert.equal(isDeliverableEndpoint('https://[2606:4700:4700::1111]/x').ok, true);
 });
 
 test('only deliverable endpoints are persisted', async (t) => {

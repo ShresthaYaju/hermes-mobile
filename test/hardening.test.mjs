@@ -15,6 +15,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startProxy, startFakeHermes, rawGet, rawRequest, rawUpgrade } from './helpers.mjs';
+import http from 'node:http';
+import { once } from 'node:events';
 
 const OWNER = 'yaju@example.com';
 const EVIL_HOST = 'evil.example.com';
@@ -453,5 +455,49 @@ test('a push read is not metered', async (t) => {
   for (let i = 0; i < 4; i += 1) {
     const response = await rawGet(proxy.port, '/push/config', identified());
     assert.equal(response.status, 200, 'a push read must not spend the write budget');
+  }
+});
+
+// An upstream that accepts a connection and then never answers is worse than
+// one that is down: the phone polls constantly, and every poll parks a socket
+// here forever. Reads are bounded for that reason. Writes deliberately are not
+// -- POST /api/cron/jobs/{id}/trigger runs the agent, and cutting it off at a
+// timeout would abandon work that is still running upstream.
+test('a read gives up on an upstream that never answers', async (t) => {
+  const stalled = http.createServer(() => {
+    // Accept, then never respond. No writeHead, no end.
+  });
+  stalled.listen(0, '127.0.0.1');
+  await once(stalled, 'listening');
+  const proxy = await startProxy({
+    hermesOrigin: `http://127.0.0.1:${stalled.address().port}`,
+    env: { HERMES_MOBILE_READ_TIMEOUT: '300' },
+  });
+  t.after(async () => {
+    await proxy.stop();
+    stalled.close();
+  });
+
+  // Raced against a deadline on purpose. Without the timeout this request never
+  // completes, and an assertion that simply awaits it would hang the whole
+  // suite rather than fail it -- which is a worse failure mode than the bug.
+  const started = Date.now();
+  const response = await Promise.race([
+    rawGet(proxy.port, '/api/status'),
+    new Promise((resolve) => setTimeout(() => resolve({ status: 'no answer' }), 5000)),
+  ]);
+  const elapsed = Date.now() - started;
+
+  assert.equal(response.status, 502, 'the read should be answered, not left hanging');
+  assert.ok(elapsed < 5000, `should give up promptly, took ${elapsed}ms`);
+});
+
+test('a read timeout that does not parse refuses to start', async () => {
+  try {
+    const proxy = await startProxy({ env: { HERMES_MOBILE_READ_TIMEOUT: 'soon' } });
+    await proxy.stop();
+    assert.fail('the server should not have started');
+  } catch (error) {
+    assert.match(error.message, /HERMES_MOBILE_READ_TIMEOUT=soon/);
   }
 });
