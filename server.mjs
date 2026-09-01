@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, statSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import process from 'node:process';
 import httpProxy from 'http-proxy-3';
@@ -15,11 +15,22 @@ const hermesOrigin = process.env.HERMES_ORIGIN ?? 'http://127.0.0.1:9119';
 const extraOrigins = new Set(
   (process.env.HERMES_MOBILE_ALLOWED_ORIGINS ?? '')
     .split(',')
-    .map((value) => value.trim().replace(/\/$/, ''))
+    .map((value) => value.trim().toLowerCase().replace(/\/$/, ''))
     .filter(Boolean),
 );
 
-const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1']);
+// 127.0.0.0/8 is all loopback, not just .1 -- a fronting proxy sourcing from
+// 127.0.0.2 is a legitimate deployment, and refusing it looks like the app is
+// broken rather than like a policy. The v4-mapped forms are included because
+// the URL parser rewrites `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`, so the
+// readable spelling is one `url.host` can never actually produce.
+function isLoopbackName(bare) {
+  if (bare === 'localhost' || bare === '::1' || bare === '0:0:0:0:0:0:0:1') return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) return true;
+  if (/^::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) return true;
+  // ::ffff:7f00:1 and friends -- the same address after canonicalisation.
+  return /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(bare);
+}
 
 // Hosts this proxy will answer for on /api and /push.
 //
@@ -49,11 +60,13 @@ function bareHost(hostWithPort) {
     const close = host.indexOf(']');
     return close === -1 ? host.slice(1) : host.slice(1, close);
   }
+  // A trailing dot is the DNS root label. `node.tail.ts.net.` is a legal and
+  // resolvable spelling, so refusing it would be a false negative.
   // A bare IPv6 literal is several colons and no port -- `::1` would otherwise
   // lose its `:1` to the port rule and stop being loopback. Only an IPv4
   // address or a name carries an unbracketed `:port`.
-  if (host.indexOf(':') !== host.lastIndexOf(':')) return host;
-  return host.replace(/:\d+$/, '');
+  if (host.indexOf(':') !== host.lastIndexOf(':')) return host.replace(/\.+$/, '');
+  return host.replace(/:\d+$/, '').replace(/\.+$/, '');
 }
 
 function isAllowedHost(hostWithPort) {
@@ -65,7 +78,7 @@ function isAllowedHost(hostWithPort) {
 
   const bare = bareHost(host);
   if (!bare) return false;
-  if (extraHosts.has(bare) || LOOPBACK.has(bare)) return true;
+  if (extraHosts.has(bare) || isLoopbackName(bare)) return true;
   // The MagicDNS name Serve presents. Tailscale controls this zone, so it is
   // not a name that can be rebound at an attacker's DNS server.
   if (bare === 'ts.net' || bare.endsWith('.ts.net')) return true;
@@ -81,7 +94,7 @@ function isAllowedHost(hostWithPort) {
 
 /** The peer on the other end of the socket, not any header it sent. */
 function isLoopbackPeer(request) {
-  return LOOPBACK.has(bareHost(request.socket?.remoteAddress ?? ''));
+  return isLoopbackName(bareHost(request.socket?.remoteAddress ?? ''));
 }
 
 // This value is generated outside the repo and shared only with the loopback
@@ -206,16 +219,18 @@ const publicDir = join(process.cwd(), 'public');
 // proxy unauthenticated, so rather than forwarding /api/* wholesale we allow
 // only the paths the mobile UI needs. Everything else is refused here and never
 // reaches Hermes.
+//
+// "Needs" is meant literally: a prefix nothing under public/ calls is reach
+// this app grants and never uses. /api/logs was the sharp one -- upstream
+// returns thousands of lines of agent log, prompts and tool output included --
+// alongside /api/analytics/, /api/cron/blueprints and /api/cron/delivery-targets.
+// All four are gone. Add one back only together with the view that calls it.
 const restReadPrefixes = [
   '/api/status',
   '/api/system/stats',
   '/api/sessions',
   '/api/profiles',
   '/api/cron/jobs',
-  '/api/cron/blueprints',
-  '/api/cron/delivery-targets',
-  '/api/analytics/',
-  '/api/logs',
   '/api/model/info',
   // The authenticated-provider catalog the Config picker lists. Named exactly
   // rather than allowing /api/model, which would also hand over the MoA preset
@@ -277,15 +292,68 @@ const websocketPath = '/api/ws';
 // double-encoded forms start.
 const ENCODED_SEPARATOR = /%(?:2f|5c|2e|25)/i;
 
+/**
+ * Only origin-form request targets (`/path`).
+ *
+ * `GET //host/api/ws`, `GET /\host/api/ws` and the absolute form all make
+ * url.host a value taken from the request line rather than from the Host
+ * header -- which is the value the Host allowlist is meant to be judging. The
+ * WHATWG parser treats `\` as `/` for special schemes, so the backslash form
+ * is the same trick wearing a different hat. No browser can emit any of them.
+ */
+function isOriginForm(target) {
+  return /^\/(?![/\\])/.test(String(target ?? ''));
+}
+
+/**
+ * Whether decoding the path would change its structure.
+ *
+ * ENCODED_SEPARATOR catches the canonical spellings, but not `%c0%af` (an
+ * overlong UTF-8 `/`) or `%%32%66`, both of which some parsers still fold into
+ * a separator. Rather than enumerate encodings forever, decode and check what
+ * comes out: a malformed escape is refused outright, since nothing here has a
+ * legitimate use for one, and a decode that adds a segment, a dot-segment or a
+ * backslash is refused because it means the string that was authorized is not
+ * the string the upstream will act on. `%20` in a name still passes.
+ */
+function decodeChangesStructure(pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return true;
+  }
+  if (decoded === pathname) return false;
+  if (decoded.includes('\\')) return true;
+  if (decoded.split('/').length !== pathname.split('/').length) return true;
+  return decoded.split('/').some((segment) => segment === '.' || segment === '..');
+}
+
 // Read prefixes are broad by design, which means they also cover the action
 // endpoints enumerated as writes below. A GET cannot run them on today's
 // backend -- it answers 405 -- but it reaches upstream unlimited and unaudited,
 // and the prefix would silently cover any future route added underneath it.
-const READ_EXCLUSIONS = /\/(?:pause|resume|trigger)$/;
+const READ_EXCLUSIONS = /\/(?:pause|resume|trigger)\/?$/i;
+
+/** The path as the upstream will read it. Safe to match on, because
+ * decodeChangesStructure() has already refused anything whose decode moves a
+ * segment boundary -- so this differs from the raw path only inside a segment. */
+function decodedPath(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
 
 function isAllowedRestRequest(method, pathname) {
   if (method === 'GET' || method === 'HEAD') {
-    if (READ_EXCLUSIONS.test(pathname)) return false;
+    // Against the decoded form too: /api/cron/jobs/x/%74rigger is `trigger` by
+    // the time upstream routes it, and the point of the exclusion is that these
+    // never travel unlimited and unaudited.
+    if (READ_EXCLUSIONS.test(pathname) || READ_EXCLUSIONS.test(decodedPath(pathname))) {
+      return false;
+    }
     return restReadPrefixes.some(
       (prefix) => pathname === prefix || pathname.startsWith(`${prefix.replace(/\/$/, '')}/`),
     );
@@ -317,7 +385,7 @@ function isSameOrigin(request, url) {
   const origin = request.headers.origin;
   if (origin === undefined) return true;
   if (!origin || origin === 'null') return false;
-  if (extraOrigins.has(origin.replace(/\/$/, ''))) return true;
+  if (extraOrigins.has(origin.toLowerCase().replace(/\/$/, ''))) return true;
 
   let originHost;
   try {
@@ -399,6 +467,7 @@ proxy.on('proxyReq', (proxyRequest) => {
   proxyRequest.removeHeader('x-forwarded-for');
   proxyRequest.removeHeader('x-forwarded-host');
   proxyRequest.removeHeader('x-forwarded-proto');
+  proxyRequest.removeHeader('x-forwarded-port');
 });
 
 // Rewriting Origin to the loopback value satisfies Hermes's own DNS-rebinding
@@ -413,6 +482,7 @@ proxy.on('proxyReqWs', (proxyRequest) => {
   proxyRequest.removeHeader('x-forwarded-for');
   proxyRequest.removeHeader('x-forwarded-host');
   proxyRequest.removeHeader('x-forwarded-proto');
+  proxyRequest.removeHeader('x-forwarded-port');
 });
 
 function securityHeaders(response) {
@@ -473,19 +543,21 @@ const server = http.createServer((request, response) => {
     // absolute form both make url.host a value the caller chose instead of the
     // Host header -- which is the value same-origin is about to be compared
     // against. No browser emits either; a raw socket does.
-    const target = String(request.url ?? '');
-    if (!target.startsWith('/') || target.startsWith('//')) {
+    if (!isOriginForm(request.url)) {
       refuseRequest(response, 400, 'Bad request.');
       return;
     }
+    // Judge the Host header, not url.host. They are the same once the target is
+    // origin-form, and checking the header directly means no future change to
+    // URL parsing can quietly move which value this decision rests on.
     // Before same-origin, because same-origin only establishes that Origin and
     // Host agree, and rebinding makes them agree on a name the attacker owns.
-    if (!isAllowedHost(url.host)) {
-      console.warn(`Refused ${url.pathname} for host ${url.host}`);
+    if (!isAllowedHost(request.headers.host) || !isAllowedHost(url.host)) {
+      console.warn(`Refused ${url.pathname} for host ${request.headers.host}`);
       refuseRequest(response, 421, 'This host is not served here.');
       return;
     }
-    if (ENCODED_SEPARATOR.test(url.pathname)) {
+    if (ENCODED_SEPARATOR.test(url.pathname) || decodeChangesStructure(url.pathname)) {
       console.warn(`Refused ${url.pathname}: encoded path separator`);
       refuseRequest(response, 400, 'Bad request.');
       return;
@@ -506,6 +578,25 @@ const server = http.createServer((request, response) => {
   }
   // Push endpoints are served by this proxy itself, not forwarded to Hermes.
   if (url.pathname.startsWith('/push/')) {
+    // Metered like an /api write. These do not reach the agent, so they are not
+    // the loop that matters -- but each one is a synchronous writeFileSync plus
+    // chmodSync, and a reader who saw /push named alongside /api in the identity
+    // gate will reasonably assume the budget covers it too.
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      const login = identify(request).login ?? 'unknown';
+      const entry = { login, method: request.method, path: url.pathname };
+      if (!withinWriteBudget(login)) {
+        audit('rate-limited', entry);
+        securityHeaders(response);
+        response.writeHead(429, {
+          'content-type': 'application/json; charset=utf-8',
+          'retry-after': '60',
+        });
+        response.end(JSON.stringify({ error: 'Too many actions in a row. Try again shortly.' }));
+        return;
+      }
+      audit('write', entry);
+    }
     securityHeaders(response);
     notifications.handleRequest(request, response, url).catch((error) => {
       console.error('Push request failed:', error.message);
@@ -567,8 +658,17 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  // existsSync and statSync are two syscalls with a gap between them: if the
+  // file goes away in that gap, statSync throws, and an exception thrown out of
+  // a request listener ends the process. One stat, and treat a throw as absent.
   const filePath = publicPath(decoded);
-  if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
+  let stats = null;
+  try {
+    stats = filePath ? statSync(filePath) : null;
+  } catch {
+    stats = null;
+  }
+  if (!stats || !stats.isFile()) {
     response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Not found');
     return;
@@ -579,7 +679,7 @@ const server = http.createServer((request, response) => {
     'Cache-Control',
     filePath.endsWith('service-worker.js') ? 'no-cache' : 'public, max-age=3600',
   );
-  // existsSync/statSync above is a check, not a hold: the file can vanish or
+  // The stat above is a check, not a hold: the file can vanish or
   // turn unreadable before open(). An unhandled 'error' on the stream is fatal,
   // and this handler is reachable without any credential.
   const stream = createReadStream(filePath);
@@ -595,10 +695,20 @@ const server = http.createServer((request, response) => {
 
 server.on('upgrade', (request, socket, head) => {
   const url = parseRequestUrl(request);
+  // The upgrade handler had no origin-form check, so `GET /\\100.64.0.1/api/ws`
+  // and the // and absolute forms all put an allowed value in url.host while
+  // the Host header said something else entirely -- and walked past the Host
+  // allowlist with the session token attached. Check the shape first, then the
+  // Host header itself.
+  if (!isOriginForm(request.url) || !url) {
+    console.warn('Refused WebSocket upgrade: request target is not origin-form');
+    socket.destroy();
+    return;
+  }
   // Same reasoning as the request gate: same-origin only proves Origin and Host
   // agree, and rebinding arranges that. Vouch for the Host first.
-  if (!url || !isAllowedHost(url.host)) {
-    console.warn(`Refused WebSocket upgrade for host ${url?.host}`);
+  if (!isAllowedHost(request.headers.host) || !isAllowedHost(url.host)) {
+    console.warn(`Refused WebSocket upgrade for host ${request.headers.host}`);
     socket.destroy();
     return;
   }
@@ -652,7 +762,7 @@ server.on('upgrade', (request, socket, head) => {
  * open to every peer on the tailnet, which is the exact failure the identity
  * gate exists to prevent. Refuse, the same way a non-loopback bind is refused.
  */
-if (!Number.isFinite(WRITE_LIMIT) || WRITE_LIMIT < 0) {
+if (!Number.isInteger(WRITE_LIMIT) || WRITE_LIMIT < 0) {
   console.error(
     [
       `Refusing to start: HERMES_MOBILE_WRITE_LIMIT=${configuredWriteLimit} is not a`,
@@ -689,7 +799,7 @@ if (!allowedLogins.size && !allowLocal) {
   process.exit(1);
 }
 
-if (!LOOPBACK.has(host) && process.env.HERMES_MOBILE_ALLOW_PUBLIC_BIND !== '1') {
+if (!isLoopbackName(bareHost(host)) && process.env.HERMES_MOBILE_ALLOW_PUBLIC_BIND !== '1') {
   console.error(
     [
       `Refusing to bind ${host}: hermes-mobile has no authentication of its own.`,

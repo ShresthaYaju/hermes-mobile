@@ -137,6 +137,37 @@ proxy library forwarded the raw request target while the check ran on a normaliz
 does not — it derives the same normalized path this file does. The real gap was narrower and
 less obvious, and a fix aimed at the wrong mechanism would have closed nothing.
 
+The first fix was also incomplete, which is the more useful half of the lesson. Refusing the
+canonical spellings `%2f`, `%5c` and `%2e` left `%c0%af` — an overlong UTF-8 solidus — and
+`%%32%66` reaching the upstream untouched. Enumerating encodings is a losing game; the rule
+that holds is to decode and ask whether decoding *changed the structure* of the path. A
+malformed escape is refused because nothing here has a use for one, and a decode that adds a
+segment, a dot-segment or a backslash is refused because it means the string authorized is not
+the string the upstream will act on. A `%20` inside a name still passes, which is the property
+that makes the rule targeted rather than a blanket ban on percent-encoding.
+
+### Why the request target has to be origin-form
+
+The `Host` allowlist above judged `url.host` — the host of the parsed request URL. For an
+ordinary request that *is* the `Host` header, so the two looked interchangeable. They are not.
+A request line may carry a target that names its own authority: `//node.ts.net/api/ws`, the
+absolute form `http://node.ts.net/api/ws`, and — because the WHATWG parser folds `\` into `/`
+for special schemes — `/\100.64.0.1/api/ws`. Each puts an allowed value in `url.host` while
+the `Host` header says something else entirely, and each walked straight past the allowlist.
+On the WebSocket upgrade, which had no target-shape check at all, that meant the session token
+was attached and the JSON-RPC socket opened.
+
+No browser can emit those targets, so this was never reachable by the rebinding attack the
+allowlist was built for — it needed a raw socket and an already-allowlisted identity. But a
+control that is documented as "anything else gets a 421" has to actually be that, and a
+fronting proxy written in a language that does not treat `\` as a separator would pass the
+form through intact.
+
+Two rules came out of it, and they generalize past this app: validate the *shape* of an input
+before reading a decision out of any part of it, and read that decision from the field you
+actually mean — the `Host` header — rather than from a parse of something an attacker controls
+more of.
+
 ### Why there is no JSON-RPC method allowlist
 
 The REST surface is meticulously gated and `/api/ws` is proxied wholesale, which reads like

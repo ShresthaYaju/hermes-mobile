@@ -26,6 +26,11 @@ const MAX_SUBSCRIPTIONS_PER_OWNER = 5;
 // short enough that the state file cannot be used as free storage.
 const MAX_ENDPOINT_LENGTH = 2048;
 const MAX_KEY_LENGTH = 256;
+// Consecutive failed deliveries before a subscription is given up on. The
+// watcher ticks about once a minute, so this is roughly ten minutes of a
+// genuinely unreachable endpoint before it is dropped -- long enough to ride
+// out a blip, short enough that a permanently broken one converges.
+const MAX_CONSECUTIVE_FAILURES = 10;
 
 const defaultStateDir = () =>
   process.env.HERMES_MOBILE_STATE_DIR ||
@@ -114,7 +119,19 @@ function isInternalIpv4([a, b]) {
 }
 
 function isInternalHost(hostname) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  // A trailing dot is the DNS root label: `localhost.` resolves exactly where
+  // `localhost` does, and the URL parser keeps it on a name (it strips it from
+  // a dotted quad, and a bracketed literal carrying one does not parse at all).
+  // Normalising it away here, alongside the brackets, is what lets every rule
+  // below judge the host the resolver will actually be handed. Repeats parse
+  // too (`localhost..`), so strip the whole run.
+  const host = hostname
+    .toLowerCase()
+    .replace(/\.+$/, '')
+    .replace(/^\[|\]$/g, '');
+  // Nothing but root labels names no host at all, and an endpoint whose target
+  // we cannot even identify is not one to keep and re-contact.
+  if (!host) return true;
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
 
   const octets = ipv4Octets(host);
@@ -272,6 +289,22 @@ export function createNotifications({
     const keys = keysAreUsable(subscription?.keys);
     if (!keys.ok) return { ok: false, reason: keys.reason };
 
+    // An endpoint is a capability URL for one specific device, so replacing an
+    // entry hands that device's alerts -- and the keys they are encrypted with
+    // -- to whoever asked. Refusing here is what makes the ownership rule in
+    // removeSubscription mean anything: without it a stranger could overwrite
+    // the entry to make it their own and then delete it, or leave unusable keys
+    // behind so every delivery fails with a non-404 that send() keeps retrying
+    // forever. The owner-less exemption is the same one described there.
+    const existing = state.subscriptions.find((s) => s.endpoint === subscription.endpoint);
+    if (existing && existing.owner != null && existing.owner !== owner) {
+      // Flagged rather than described, so the HTTP layer can answer exactly as
+      // it does for a refused removal: a status the caller could tell apart
+      // from success would turn /push/subscribe into a probe for which
+      // endpoints this host holds.
+      return { ok: false, reason: 'endpoint belongs to another identity', conflict: true };
+    }
+
     state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== subscription.endpoint);
     state.subscriptions.push({
       endpoint: subscription.endpoint,
@@ -299,11 +332,12 @@ export function createNotifications({
    * HERMES_MOBILE_ALLOW_LOCAL is on -- could silently unsubscribe another
    * person's phone and leave them believing they were still being alerted.
    *
-   * Subscriptions persisted before ownership was recorded stay removable by
-   * anyone rather than being migrated: on load there is no identity to
-   * attribute them to, and dropping them outright would stop alerts for a
-   * device that is still registered. The gap closes on its own, since browsers
-   * re-POST their subscription on every load.
+   * Subscriptions persisted before ownership was recorded stay removable -- and
+   * replaceable, see addSubscription -- by anyone rather than being migrated:
+   * on load there is no identity to attribute them to, and dropping them
+   * outright would stop alerts for a device that is still registered. The gap
+   * closes on its own, since browsers re-POST their subscription on every load,
+   * and the first such POST is what puts an owner on the entry.
    */
   function removeSubscription(endpoint, owner = null) {
     const before = state.subscriptions.length;
@@ -322,12 +356,25 @@ export function createNotifications({
       state.subscriptions.map(async (subscription) => {
         try {
           await deliver(subscription, body);
+          subscription.failures = 0;
         } catch (error) {
-          // 404/410 mean the browser threw the subscription away. Anything else
-          // is transient and the subscription is kept.
-          if (error.statusCode === 404 || error.statusCode === 410)
+          // 404/410 mean the browser threw the subscription away.
+          if (error.statusCode === 404 || error.statusCode === 410) {
             dead.push(subscription.endpoint);
-          else console.error('Push send failed:', error.statusCode ?? error.message);
+            return;
+          }
+          // Anything else may be a blip, so one failure is not a verdict -- but
+          // "kept forever" is not either. An endpoint that has failed this many
+          // ticks in a row is not coming back, and retrying it every minute for
+          // the life of the process is noise that hides the alerts that matter.
+          subscription.failures = (subscription.failures ?? 0) + 1;
+          console.error('Push send failed:', error.statusCode ?? error.message);
+          if (subscription.failures >= MAX_CONSECUTIVE_FAILURES) {
+            console.error(
+              `Dropping a push subscription after ${MAX_CONSECUTIVE_FAILURES} consecutive failures.`,
+            );
+            dead.push(subscription.endpoint);
+          }
         }
       }),
     );
@@ -429,6 +476,13 @@ export function createNotifications({
       const result = addSubscription(body, callerLogin(request));
       if (result.ok) return json(response, 204, null);
       console.warn('Refused push subscription:', result.reason);
+      // An endpoint someone else registered answers like a stored one, for the
+      // same reason /push/unsubscribe always answers 204: the caller supplied a
+      // subscription that is valid in every other respect, so a distinct code
+      // here would say "this host holds that endpoint, and not for you". The
+      // caller's own device is simply not registered, and its browser re-POSTs
+      // on the next load.
+      if (result.conflict) return json(response, 204, null);
       // Deliberately uniform: which rule rejected it stays in the log.
       return json(response, 400, { error: 'That push subscription was not accepted.' });
     }

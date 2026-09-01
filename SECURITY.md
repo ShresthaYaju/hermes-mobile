@@ -58,9 +58,13 @@ deliberately withholds, without satisfying every control below:
   way to make the proxy answer for a `Host` it should not, or to reach the
   upgrade on a path other than `/api/ws`, is a serious finding: both were real
   bugs here.
-- Getting the `Tailscale-User-Login` header believed off a non-loopback socket,
-  or getting a client-supplied copy of it — or of the session token — relayed
-  upstream.
+- Getting the `Tailscale-User-Login` header believed off a non-loopback socket
+  (loopback means all of `127.0.0.0/8` and the IPv6 equivalents), or getting a
+  client-supplied copy of it — or of the session token — relayed upstream.
+- Getting the proxy to answer for a `Host` outside the allowlist by any route,
+  including a non-origin-form request target that moves where `url.host` comes
+  from. Three such forms were live bugs here and are now refused on both the
+  HTTP path and the WebSocket upgrade.
 - Reaching a route the REST allowlist withholds — notably `/api/env/reveal`
   (plaintext secrets), `/api/files` (filesystem), `/api/ops` (gateway
   lifecycle) — by path traversal, encoding tricks, prefix confusion, or method
