@@ -44,3 +44,67 @@ test('the service worker precaches every shipped module', () => {
     assert.match(worker, new RegExp(`'/${name.replace('.', '\\.')}'`), `${name} is not precached`);
   }
 });
+
+// The write used to run outside waitUntil and had no .catch, so a worker
+// recycled mid-write lost the cache silently and a rejection went nowhere.
+// There is no SW runtime in Node to execute this against, so the fix is
+// pinned at the source level: the same statement that opens the cache must be
+// an argument to event.waitUntil, and the chain must end in a catch.
+test('the fetch handler writes its cache copy inside waitUntil, with a catch', () => {
+  const worker = read('service-worker.js');
+  const fetchHandler = worker.slice(
+    worker.indexOf("addEventListener('fetch'"),
+    worker.indexOf("addEventListener('push'"),
+  );
+  assert.match(
+    fetchHandler,
+    /event\.waitUntil\(\s*caches\s*\.open\(CACHE\)\s*\.then\(\(cache\) => cache\.put\(request, copy\)\)\s*\.catch\(\(\) => \{\}\),?\s*\)/,
+    'caches.open(...).then(cache => cache.put(...)) must be wrapped in event.waitUntil(...) with a .catch',
+  );
+});
+
+// notificationclick used to navigate the first same-origin client it found,
+// visible or not -- silently redirecting a background tab nobody was looking
+// at instead of opening a fresh window.
+test('notificationclick only navigates a visible client, and opens a window otherwise', () => {
+  const worker = read('service-worker.js');
+  const handler = worker.slice(
+    worker.indexOf("addEventListener('notificationclick'"),
+    worker.indexOf("addEventListener('pushsubscriptionchange'"),
+  );
+  assert.match(handler, /visibilityState === 'visible'/, 'must prefer a visible/focused client');
+  assert.match(
+    handler,
+    /self\.clients\.openWindow\(/,
+    'a background-only match must open a window',
+  );
+  // sameOriginTarget() itself is audited correct and must stay as-is.
+  assert.match(worker, /function sameOriginTarget\(url\)/);
+});
+
+// The server can evict a subscription on its own (cap, failures, a lost state
+// file); the platform's own way of telling this app is pushsubscriptionchange,
+// and a worker with no listener for it just stops delivering, silently.
+test('pushsubscriptionchange re-subscribes with the host key and re-registers it', () => {
+  const worker = read('service-worker.js');
+  assert.match(worker, /addEventListener\('pushsubscriptionchange'/);
+  const handler = worker.slice(worker.indexOf("addEventListener('pushsubscriptionchange'"));
+  assert.match(handler, /event\.waitUntil\(/, "must extend the worker's lifetime while it runs");
+  assert.match(handler, /\/push\/config/, 'must fetch the current VAPID public key from the host');
+  assert.match(handler, /pushManager\.subscribe\(/, 'must re-subscribe the browser');
+  assert.match(
+    handler,
+    /applicationServerKey/,
+    'must re-subscribe with the same host key, not a stale one',
+  );
+  assert.match(
+    handler,
+    /\/push\/subscribe/,
+    'must tell the host about the replacement subscription',
+  );
+  assert.match(
+    handler,
+    /credentials:\s*'same-origin'/,
+    'must carry the identity cookie back to the host',
+  );
+});

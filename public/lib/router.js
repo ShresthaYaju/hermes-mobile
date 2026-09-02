@@ -31,14 +31,38 @@ export function currentPath() {
   return location.hash.replace(/^#/, '') || '/now';
 }
 
-function match(path) {
+// Params arrive as raw hash text. Callers (chat.js, threads.js, ...) build the
+// hash with encodeURIComponent, so a param carrying `%` or `/` reaches here
+// still encoded -- decode it once, here, or every one of those callers has to
+// encode it a second time before using it in a REST path, and a literal space
+// or slash in a thread id turns into a double-encoded `%2520` or `%252F` on
+// the wire.
+function decodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // Malformed percent-escapes (e.g. a bare `%`) are not this router's to
+    // fix -- pass the raw value through rather than throwing the whole route.
+    return value;
+  }
+}
+
+// Exported for its own pure-function test: matching and decoding need no DOM,
+// so they should not have to go through startRouter()'s document/location
+// dependencies to be pinned.
+export function match(path) {
   for (const route of routes) {
     if (typeof route.pattern === 'string') {
       if (route.pattern === path) return { factory: route.factory, params: {} };
       continue;
     }
     const found = path.match(route.pattern);
-    if (found) return { factory: route.factory, params: found.groups || {} };
+    if (!found) continue;
+    const params = {};
+    for (const [key, value] of Object.entries(found.groups || {})) {
+      params[key] = value === undefined ? value : decodeParam(value);
+    }
+    return { factory: route.factory, params };
   }
   return null;
 }

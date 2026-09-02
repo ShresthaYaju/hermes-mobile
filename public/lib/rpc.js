@@ -54,9 +54,30 @@ export class HermesSocket extends EventTarget {
       this.#scheduleReconnect();
       return;
     }
+    // A socket from a previous #open() can still be outstanding here -- a
+    // phone that backgrounds and quickly foregrounds again calls connect()
+    // while the old attempt is still CONNECTING, since `connected` is false
+    // for anything short of OPEN. Left alone that old socket can open (or
+    // close) after this one has already taken over; close it so it becomes
+    // exactly what its own listeners below already know to ignore.
+    //
+    // #socket is reassigned *before* the close so that the stale socket's own
+    // `drop` sees itself as already-replaced (the same identity check as
+    // below) and does not treat this deliberate close as a dropped
+    // connection -- closing the old attempt must not itself schedule a
+    // reconnect on top of the one already taking its place.
+    const stale = this.#socket;
     this.#socket = socket;
+    stale?.close();
 
     socket.addEventListener('open', () => {
+      // Mirrors `drop`'s guard: an orphaned socket opening late must not
+      // resurrect state (or reset the backoff) that belongs to whichever
+      // socket replaced it.
+      if (this.#socket !== socket) {
+        socket.close();
+        return;
+      }
       this.#attempts = 0;
       this.#setState('live');
     });

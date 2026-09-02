@@ -33,8 +33,22 @@ export async function pushState() {
 
   const registration = await navigator.serviceWorker.ready;
   const subscription = await registration.pushManager.getSubscription();
-  if (subscription)
+  if (subscription) {
+    // getSubscription() only reports what the browser remembers -- it says
+    // nothing about whether the host still holds this endpoint. The host can
+    // evict it on its own (delivery failures, the per-owner cap, a state file
+    // that did not survive a restart), and this device would otherwise keep
+    // showing On forever. /push/subscribe is idempotent (it answers 204
+    // whether the entry was already there or just got re-added), so posting
+    // it here is free the rest of the time and self-healing the one time it
+    // is not.
+    try {
+      await api.subscribePush(subscription.toJSON());
+    } catch {
+      return { available: true, subscribed: false, stale: true, reason: 'Needs re-enabling' };
+    }
     return { available: true, subscribed: true, reason: 'On — alerts for failed jobs' };
+  }
   if (Notification.permission === 'denied') {
     return { available: false, subscribed: false, reason: 'Blocked in browser settings' };
   }
