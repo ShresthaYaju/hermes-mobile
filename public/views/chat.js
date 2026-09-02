@@ -103,19 +103,15 @@ export function chatView({ id } = {}) {
     placeholder: 'Message Hermes',
     autocomplete: 'off',
   });
-  const send = el('button', { class: 'composer-send', 'aria-label': 'Send', disabled: true }, '↑');
-  const stop = el('button', { class: 'btn btn--stop', hidden: true }, 'Stop');
+  const send = el(
+    'button',
+    { class: 'composer-action composer-send', 'aria-label': 'Send', disabled: true },
+    '↑',
+  );
   const composer = el(
     'form',
     { class: 'composer' },
-    input,
-    el(
-      'div',
-      { class: 'composer-row' },
-      el('span', { class: 'composer-hint' }, 'Enter sends'),
-      stop,
-      send,
-    ),
+    el('div', { class: 'composer-field' }, input, send),
   );
   // The jump button is a sibling of the scrollport, not a child of it: inside
   // the transcript it would scroll away with the content it points at.
@@ -305,14 +301,6 @@ export function chatView({ id } = {}) {
   composer.addEventListener('submit', (event) => {
     event.preventDefault();
     submit();
-  });
-  stop.addEventListener('click', async () => {
-    if (!liveId) return;
-    try {
-      await socket.call('session.interrupt', { session_id: liveId });
-    } catch (error) {
-      toast(error.message, 'error');
-    }
   });
 
   /**
@@ -721,7 +709,6 @@ export function chatView({ id } = {}) {
 
   const renderActivity = () => {
     if (disposed) return;
-    stop.hidden = !running || !liveId;
     send.disabled = !input.value.trim() || running;
     if (!running) {
       activity.hidden = true;
