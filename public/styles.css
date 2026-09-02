@@ -1058,52 +1058,63 @@ body {
   background: var(--bg);
 }
 
-.composer-input {
-  width: 100%;
-  max-height: 160px;
-  padding: 9px 12px;
+/* The wrapper is the visible field: the textarea inside it has no border or
+   background of its own, and the send button sits beside it as an ordinary
+   flex item. Nothing is absolutely positioned, so there are no offsets to keep
+   in sync with the textarea's padding or line-height. */
+.composer-field {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 6px 6px 6px 14px;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: 22px;
   background: var(--bg-sunken);
+}
+
+.composer-field:focus-within {
+  border-color: var(--accent-dim);
+}
+
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  max-height: 160px;
+  /* 6px field padding + 5px here + 20px line = a 42px resting field, the
+     same height as the button row on the right. */
+  padding: 5px 0;
+  border: 0;
+  background: none;
   overflow-y: auto;
   color: var(--text);
   font-family: inherit;
   font-size: 16px;
-  line-height: 1.4;
+  line-height: 20px;
   resize: none;
 }
 
 .composer-input:focus {
-  border-color: var(--accent-dim);
   outline: none;
 }
 
-.composer-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.composer-hint {
-  flex: 1;
-  color: var(--text-faint);
-  font-size: 11px;
+/* align-items: flex-end on the field keeps the button on the last line of a
+   growing multi-line draft, next to where the text is being typed. */
+.composer-action {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .composer-send {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 0;
-  border-radius: 50%;
   background: var(--accent);
   color: var(--accent-ink);
-  font-size: 16px;
-  font-weight: 700;
-  cursor: pointer;
 }
 
 .composer-send:disabled {
