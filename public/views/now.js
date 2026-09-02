@@ -26,6 +26,13 @@ import {
   duration,
 } from '../lib/ui.js';
 import { navigate } from '../lib/router.js';
+import { clip } from '../lib/transcript.js';
+
+// A command is shown in full up to this length. Past it, an approval with
+// hundreds of newlines (a heredoc, a generated script) would push Allow/Deny
+// below the fold with nothing on screen saying why -- the one card in this
+// app a reader must always be able to act on immediately.
+const COMMAND_CLIP = 2000;
 
 export function nowView() {
   const root = el('div', { class: 'view' });
@@ -208,7 +215,7 @@ function approvalCard({ id, payload }) {
       el('span', { 'aria-hidden': 'true' }, '⚠︎'),
       el('span', {}, isClarify ? 'Needs an answer' : 'Allow this?'),
     ),
-    el('pre', { class: 'approval-command mono' }, command),
+    el('pre', { class: 'approval-command mono' }, clip(command, COMMAND_CLIP)),
   );
 
   if (isClarify) {
@@ -262,7 +269,11 @@ function approvalCard({ id, payload }) {
     const buttons = card.querySelectorAll('button');
     buttons.forEach((b) => (b.disabled = true));
     try {
-      await socket.call(method, { session_id: state.sessionId, ...params });
+      // The approval names its own session (see store.js's event handler);
+      // state.sessionId is only a fallback for a payload that predates that,
+      // or genuinely never carried one.
+      const sessionId = payload.session_id || state.sessionId;
+      await socket.call(method, { session_id: sessionId, ...params });
       removeApproval(id);
     } catch (error) {
       // Keep the card on screen: a failed response must stay answerable.

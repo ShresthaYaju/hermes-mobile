@@ -45,6 +45,10 @@ import {
   outboxFor,
   dequeueMessage,
   adoptQueued,
+  markOutboxSubmitted,
+  markOutboxUncertain,
+  markOutboxDeterministicFailure,
+  resetOutboxIssue,
 } from '../lib/store.js';
 import { renderTranscript, textOf } from '../lib/transcript.js';
 import { OWN_SOURCE } from '../lib/threads.js';
@@ -62,6 +66,27 @@ import {
 } from '../lib/ui.js';
 
 const HISTORY_PAGE = 200;
+
+/**
+ * Whether a prompt.submit rejection leaves us unable to say if the gateway
+ * ever got the prompt -- as opposed to a *deterministic* refusal, which
+ * definitely did not go through. Two shapes of "unknown":
+ *
+ *   * 'Connection closed' (rpc.js's `drop`): the send() already happened: the
+ *     bytes left the device before the socket dropped.
+ *   * '... timed out' (rpc.js's per-call timeout): CALL_TIMEOUT_MS gave up
+ *     waiting for a response frame, which says nothing about whether the
+ *     gateway received and is still working the request.
+ *
+ * Either way, auto-resending risks a duplicate turn -- see deliver() and
+ * flushOutbox(), the only two callers, and store.js's markOutboxUncertain.
+ * Exported for its own test: this is the one piece of that logic pure enough
+ * to check without a DOM.
+ */
+export function outcomeUnknown(error) {
+  const message = error?.message || '';
+  return message === 'Connection closed' || message.endsWith(' timed out');
+}
 
 export function chatView({ id } = {}) {
   // "new" is a reserved draft route. Real thread ids are timestamped
@@ -193,7 +218,7 @@ export function chatView({ id } = {}) {
     const waiting = outboxFor(threadId);
     if (!waiting.length) return;
     messages.querySelector('.welcome')?.remove();
-    for (const entry of waiting) hold(append(messages, 'user', entry.text), entry);
+    for (const entry of waiting) paintEntry(append(messages, 'user', entry.text), entry);
     scrollDown(messages);
   }
 
@@ -352,12 +377,19 @@ export function chatView({ id } = {}) {
     assistantText = '';
     assistantNode = append(messages, 'assistant', '');
     scrollDown(messages);
+    // Set only once attach() has actually resolved and the prompt.submit call
+    // is about to go out -- this is what lets the catch below tell "the
+    // gateway may already have this prompt" (submit sent, then the pipe
+    // closed) apart from "it never even reached the wire" (attach() itself
+    // failed). Only the former is unsafe to auto-resend.
+    let submitting = false;
     try {
       // Resuming a cold thread rebuilds its agent, which is seconds of work on
       // a large transcript. Say so rather than showing an idle typing dot.
       if (!liveId && threadId) update({ running: true, activity: 'attaching' });
       renderActivity();
       const sessionId = await attach();
+      submitting = true;
       await socket.call('prompt.submit', { session_id: sessionId, text });
     } catch (error) {
       assistantNode?.remove();
@@ -368,7 +400,16 @@ export function chatView({ id } = {}) {
       // Which failure it was decides what happens next: a socket that went away
       // mid-send will come back and flush, while a gateway that refused the
       // prompt will refuse it again, so that one waits for a deliberate retry.
-      if (!socket.connected) hold(node);
+      if (submitting && outcomeUnknown(error)) {
+        // The submit itself reached the wire before the drop, or the answer
+        // simply never arrived in time -- either way the gateway may already
+        // be running this turn. Resubmitting it automatically on the next
+        // reconnect risks doubling it, so this one waits for the reader
+        // instead (markOutboxUncertain, below).
+        const entry = queueMessage(threadId, node.dataset.text || '');
+        markOutboxUncertain(entry.id);
+        paintEntry(node, entry);
+      } else if (!socket.connected) hold(node);
       else fail(node, error.message);
       renderActivity();
     }
@@ -377,10 +418,33 @@ export function chatView({ id } = {}) {
   /** Mark a bubble as waiting, and queue its text if it is not queued already. */
   function hold(node, existing) {
     const entry = existing || queueMessage(threadId, node.dataset.text || '');
+    return paintEntry(node, entry);
+  }
+
+  /**
+   * Attach `node` to `entry` and show whichever outbox state it is currently
+   * in -- queued, needing a deliberate resend (uncertain or failed), or (via
+   * release()) neither. The single place that has to know all three so a
+   * reload (paintQueued) and a fresh failure (deliver, flushOutbox) never
+   * disagree about how one is rendered.
+   */
+  function paintEntry(node, entry) {
     queuedNodes.set(entry.id, node);
     node.dataset.queued = entry.id;
-    node.classList.add('msg--pending');
-    status(node, 'Queued · sends when Hermes is back');
+    clearMessageState(node);
+    if (entry.failed) {
+      node.classList.add('msg--failed');
+      status(node, 'Not sent · tap to resend');
+    } else if (entry.uncertain) {
+      node.classList.add('msg--uncertain');
+      status(node, 'May not have sent · tap to resend');
+    } else {
+      node.classList.add('msg--pending');
+      status(
+        node,
+        entry.durable === false ? 'Queued in this tab only' : 'Queued · sends when Hermes is back',
+      );
+    }
     return entry;
   }
 
@@ -398,7 +462,7 @@ export function chatView({ id } = {}) {
   }
 
   function clearMessageState(node) {
-    node.classList.remove('msg--pending', 'msg--failed');
+    node.classList.remove('msg--pending', 'msg--failed', 'msg--uncertain');
     node.querySelector('.msg-status')?.remove();
   }
 
@@ -416,7 +480,9 @@ export function chatView({ id } = {}) {
   // rendered by the shared transcript renderer, not built here.
 
   const retryable = (node) =>
-    node.classList.contains('msg--failed') || node.classList.contains('msg--pending');
+    node.classList.contains('msg--failed') ||
+    node.classList.contains('msg--pending') ||
+    node.classList.contains('msg--uncertain');
 
   function renderActions(node) {
     const existing = node.querySelector('.msg-actions');
@@ -432,7 +498,13 @@ export function chatView({ id } = {}) {
         ? el(
             'button',
             { class: 'msg-action msg-action--retry', type: 'button', onclick: () => retry(node) },
-            node.classList.contains('msg--failed') ? 'Retry' : 'Send now',
+            // Failed and uncertain both require the same deliberate tap; the
+            // wording just says which kind of doubt it is resolving.
+            node.classList.contains('msg--failed')
+              ? 'Retry'
+              : node.classList.contains('msg--uncertain')
+                ? 'Resend'
+                : 'Send now',
           )
         : null,
     );
@@ -452,8 +524,14 @@ export function chatView({ id } = {}) {
     if (!text || running) return;
     // Already durable: the queue owns this one, so a retry is a flush, not a
     // second send. Sending it here would put the same text on the wire twice.
-    if (node.dataset.queued) flushOutbox();
-    else deliver(text, node);
+    if (node.dataset.queued) {
+      // The tap itself is the deliberate gesture an uncertain or failed entry
+      // is waiting for -- clear the block so the ordinary (still oldest-first)
+      // flush picks it back up instead of skipping past it again.
+      const entry = resetOutboxIssue(node.dataset.queued);
+      if (entry) paintEntry(node, entry);
+      flushOutbox();
+    } else deliver(text, node);
   }
 
   messages.addEventListener('click', (event) => {
@@ -584,22 +662,50 @@ export function chatView({ id } = {}) {
     try {
       for (const entry of outboxFor(threadId)) {
         if (disposed || !socket.connected) break;
+        // An entry needing a deliberate resend (an uncertain submit, or three
+        // deterministic refusals -- see below) must not be retried on its
+        // own, and nothing behind it may jump ahead either: the outbox stays
+        // strictly ordered, the same as any other failure below.
+        if (entry.uncertain || entry.failed) break;
         const node = queuedNodes.get(entry.id);
+        // Split from prompt.submit below so an unknown-outcome rejection
+        // (see outcomeUnknown) from *this* call can never be mistaken for one
+        // from the submit itself -- attach() failing means the prompt never
+        // reached the wire, which is always safe to leave for the next flush.
+        let sessionId;
         try {
           // Attaching here as well as in reattach() covers the draft case: a
           // thread minted by the first entry is what the rest are sent into.
-          const sessionId = await attach();
-          await socket.call('prompt.submit', { session_id: sessionId, text: entry.text });
-          dequeueMessage(entry.id);
-          release(node);
-          sent += 1;
+          sessionId = await attach();
         } catch (error) {
-          // The entry stays queued either way. A refusal is worth showing on
-          // the message it belongs to; a dropped socket is not, since the next
-          // reconnect will simply try again.
           if (socket.connected && node) fail(node, error.message);
           break;
         }
+        try {
+          markOutboxSubmitted(entry.id);
+          await socket.call('prompt.submit', { session_id: sessionId, text: entry.text });
+        } catch (error) {
+          if (outcomeUnknown(error)) {
+            // Sent before the drop, or answered too late to tell -- outcome
+            // unknown either way. See deliver()'s catch for why this has to
+            // wait for the reader rather than retry itself into a possible
+            // duplicate turn.
+            markOutboxUncertain(entry.id);
+            if (node) paintEntry(node, entry);
+          } else {
+            // A real refusal, not a dropped pipe: safe to retry, but not
+            // forever -- see markOutboxDeterministicFailure.
+            const updated = markOutboxDeterministicFailure(entry.id);
+            if (socket.connected && node) {
+              if (updated?.failed) paintEntry(node, updated);
+              else fail(node, error.message);
+            }
+          }
+          break;
+        }
+        dequeueMessage(entry.id);
+        release(node);
+        sent += 1;
       }
     } finally {
       flushing = false;

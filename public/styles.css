@@ -761,6 +761,11 @@ body {
   font-size: 12.5px;
   line-height: 1.5;
   white-space: pre-wrap;
+  /* The text itself is clipped to 2000 chars (views/now.js), but even that
+     can run to dozens of visual lines -- cap the box too, so Allow/Deny below
+     it are never pushed off screen. */
+  max-height: 40vh;
+  overflow: auto;
 }
 
 .approval-actions {

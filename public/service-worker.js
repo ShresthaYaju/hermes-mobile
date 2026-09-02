@@ -4,7 +4,7 @@
 // pinned whatever shipped on the first visit, so an installed home-screen app
 // could never pick up a new build. Cache is the fallback, not the source.
 
-const CACHE = 'hermes-mobile-v4';
+const CACHE = 'hermes-mobile-v5';
 
 const ASSETS = [
   '/',
@@ -71,7 +71,15 @@ self.addEventListener('fetch', (event) => {
       .then((response) => {
         if (response && response.ok) {
           const copy = response.clone();
-          caches.open(CACHE).then((cache) => cache.put(request, copy));
+          // Was a floating promise: outside waitUntil, the SW could be
+          // recycled mid-write, and nothing observed a rejection either. Both
+          // now go through the same lifecycle the response itself is on.
+          event.waitUntil(
+            caches
+              .open(CACHE)
+              .then((cache) => cache.put(request, copy))
+              .catch(() => {}),
+          );
         }
         return response;
       })
@@ -126,16 +134,71 @@ self.addEventListener('notificationclick', (event) => {
   // The payload is encrypted to this host's VAPID keys, so a hostile url here
   // means the keys are already gone -- but a notification click should not be
   // able to navigate the app off-origin regardless of who is sending.
-  const target = sameOriginTarget(event.notification.data?.url);
+  const url = sameOriginTarget(event.notification.data?.url);
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
-      for (const client of clients) {
-        if (client.url.startsWith(self.location.origin)) {
-          client.navigate(target).catch(() => {});
-          return client.focus();
-        }
+      // A visible/focused tab is what the reader is actually looking at right
+      // now; a background one is not, and navigating it out from under
+      // whatever it is doing would be as unwelcome as it is invisible to
+      // them. Only a visible tab is a legitimate target -- anything else
+      // opens a fresh window instead of hijacking one nobody is looking at.
+      const winner = clients.find(
+        (client) =>
+          client.url.startsWith(self.location.origin) && client.visibilityState === 'visible',
+      );
+      if (winner) {
+        winner.navigate(url).catch(() => {});
+        return winner.focus();
       }
-      return self.clients.openWindow(target);
+      return self.clients.openWindow(url);
     }),
   );
 });
+
+// The platform can invalidate a push subscription on its own -- a browser
+// key rotation, the user revoking notification permission at the OS level --
+// without this app ever being open to notice. Its contract with us is this
+// event: re-subscribe with the same VAPID key and tell the host about the
+// replacement, or deliveries start failing silently against a dead endpoint.
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      let config;
+      try {
+        config = await fetch('/push/config', { credentials: 'same-origin' }).then((r) => r.json());
+      } catch {
+        return;
+      }
+      if (!config?.enabled || !config.publicKey) return;
+      let subscription;
+      try {
+        subscription = await self.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(config.publicKey),
+        });
+      } catch {
+        // Permission may have been the thing revoked; nothing to re-register.
+        return;
+      }
+      await fetch('/push/subscribe', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(subscription.toJSON()),
+      }).catch(() => {});
+    })(),
+  );
+});
+
+// Duplicated from lib/push.js rather than imported: this file loads as a
+// classic (non-module) script -- registered with no `{ type: 'module' }` --
+// so it cannot import across that boundary.
+function urlBase64ToUint8Array(base64) {
+  const padded = `${base64}${'='.repeat((4 - (base64.length % 4)) % 4)}`
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  const raw = atob(padded);
+  const output = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) output[i] = raw.charCodeAt(i);
+  return output;
+}

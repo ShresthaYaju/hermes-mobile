@@ -49,6 +49,14 @@
   border: 1px solid var(--accent-dim);
 }
 
+/* An uncertain send is neither a promise (pending) nor a known refusal
+   (failed): the request reached the gateway before the pipe closed, so it
+   may already be running. --warn rather than --error keeps it from reading
+   as a definite failure it might not be. */
+.msg--uncertain .bubble {
+  border: 1px dashed var(--warn);
+}
+
 .msg-status {
   margin-top: 4px;
   color: var(--text-faint);
@@ -58,6 +66,10 @@
 
 .msg--failed .msg-status {
   color: var(--error);
+}
+
+.msg--uncertain .msg-status {
+  color: var(--warn);
 }
 
 .msg--assistant .msg-status,

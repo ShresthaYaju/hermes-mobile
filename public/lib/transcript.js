@@ -237,7 +237,9 @@ function firstLine(text) {
   return compact.length > 46 ? `${compact.slice(0, 46)}…` : compact;
 }
 
-function clip(text, max) {
+// Exported: the approval card in views/now.js clips a command the same way,
+// so a run of newlines in it cannot push Allow/Deny off screen.
+export function clip(text, max) {
   const value = String(text);
   return value.length > max
     ? `${value.slice(0, max)}\n… ${value.length - max} more characters`

@@ -91,18 +91,47 @@ function restoreOutbox() {
     const raw = storage()?.getItem(OUTBOX_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry) => entry && typeof entry.text === 'string' && entry.id);
+    return parsed
+      .filter((entry) => entry && typeof entry.text === 'string' && entry.id)
+      .map((entry) => {
+        const restored = {
+          attempts: 0,
+          submitted: false,
+          uncertain: false,
+          failed: false,
+          ...entry,
+          // Anything found in storage necessarily persisted, whatever it was
+          // stamped with when it was queued.
+          durable: true,
+        };
+        // markOutboxSubmitted() persists `submitted: true` *before*
+        // prompt.submit resolves -- that is the whole point, it has to
+        // survive a drop mid-call. But it also means a reload or a killed
+        // tab can catch an entry mid-flight: nothing observed how that call
+        // ended. That is exactly as unknown as a 'Connection closed'
+        // rejection would have left it, so it is restored the same way --
+        // unless it had already reached the 3-strike cap, which is a known
+        // (not unknown) outcome.
+        if (restored.submitted && !restored.failed) restored.uncertain = true;
+        return restored;
+      });
   } catch {
     return [];
   }
 }
 
+/** Returns whether the write actually reached storage, so a caller can tell a
+ *  durable queue from one that only lives as long as this tab does. */
 function persistOutbox() {
+  const store = storage();
+  if (!store) return false;
   try {
-    storage()?.setItem(OUTBOX_KEY, JSON.stringify(state.outbox));
+    store.setItem(OUTBOX_KEY, JSON.stringify(state.outbox));
+    return true;
   } catch {
     // Quota or a locked-down browser. The in-memory queue still holds, so the
     // message survives everything except closing the tab.
+    return false;
   }
 }
 
@@ -115,8 +144,72 @@ export function queueMessage(threadId, text) {
     threadId: threadId || null,
     text,
     queuedAt: Date.now(),
+    // attempts/submitted/uncertain/failed together decide what a reconnect is
+    // allowed to do with this entry automatically -- see flushOutbox() in
+    // chat.js. submitted only ever means "a prompt.submit for this entry
+    // actually reached the wire", never "attach() ran".
+    attempts: 0,
+    submitted: false,
+    uncertain: false,
+    failed: false,
   };
   state.outbox.push(entry);
+  entry.durable = persistOutbox();
+  emit();
+  return entry;
+}
+
+/** The wire has this entry's prompt.submit in flight (or just resolved). */
+export function markOutboxSubmitted(id) {
+  const entry = state.outbox.find((e) => e.id === id);
+  if (!entry) return null;
+  entry.submitted = true;
+  persistOutbox();
+  emit();
+  return entry;
+}
+
+/**
+ * A submitted entry's socket dropped before the response arrived: the
+ * gateway may already have the prompt. Outcome unknown, so this entry must
+ * wait for a deliberate resend rather than being retried by the next
+ * reconnect -- resubmitting a prompt that is already running would double it.
+ */
+export function markOutboxUncertain(id) {
+  const entry = state.outbox.find((e) => e.id === id);
+  if (!entry) return null;
+  entry.uncertain = true;
+  persistOutbox();
+  emit();
+  return entry;
+}
+
+/**
+ * A rejection that is *not* 'Connection closed' -- the call itself refused,
+ * or the gateway did. Unlike an uncertain entry this one definitely did not
+ * go through, so auto-retrying it is safe -- but only up to a point, since a
+ * refusal that keeps recurring (a stale session, a malformed prompt) would
+ * otherwise retry forever on every reconnect. The third strike requires a
+ * deliberate resend, same as an uncertain entry.
+ */
+export function markOutboxDeterministicFailure(id) {
+  const entry = state.outbox.find((e) => e.id === id);
+  if (!entry) return null;
+  entry.attempts += 1;
+  if (entry.attempts >= 3) entry.failed = true;
+  persistOutbox();
+  emit();
+  return entry;
+}
+
+/** Clear a stuck entry's block and give it a fresh retry budget, for the
+ *  explicit tap that is the only thing allowed to do so. */
+export function resetOutboxIssue(id) {
+  const entry = state.outbox.find((e) => e.id === id);
+  if (!entry) return null;
+  entry.uncertain = false;
+  entry.failed = false;
+  entry.attempts = 0;
   persistOutbox();
   emit();
   return entry;
@@ -164,13 +257,17 @@ socket.addEventListener('state', ({ detail }) => {
 });
 
 socket.addEventListener('event', ({ detail }) => {
-  const { type, payload = {} } = detail;
+  const { type, session_id: sessionId, payload = {} } = detail;
   switch (type) {
+    // The live handle an approval answers to is the one the event arrived on,
+    // not necessarily the chat view's current one -- a reconnect can swap
+    // state.sessionId out from under a card still on screen. Stamping it here
+    // is what lets now.js answer against the request's own session instead.
     case 'approval.request':
-      addApproval(payload);
+      addApproval({ ...payload, session_id: sessionId });
       break;
     case 'clarify.request':
-      addApproval({ ...payload, kind: 'clarify' });
+      addApproval({ ...payload, session_id: sessionId, kind: 'clarify' });
       break;
     case 'message.start':
       update({ running: true, activity: 'thinking', turnStartedAt: Date.now() });
