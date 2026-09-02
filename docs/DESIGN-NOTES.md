@@ -220,6 +220,32 @@ exactly rather than allowing the `/api/model` prefix.
 This is a **constraint to preserve, not a boundary the proxy enforces**, and it should be read
 that way by anyone adding a call to that endpoint.
 
+### Why a push endpoint is checked twice, not once
+
+A stored push subscription is not a one-time input. It is a standing instruction: web-push
+turns it into an outbound HTTPS request from inside the tailnet, refired on every failing cron
+tick, for as long as it stays in the state file. Validating it only when it arrives treats it
+like the former and builds for the latter.
+
+The obvious check — refuse an endpoint whose host is plainly internal (a private or CGNAT IP,
+a dotless name, `.local`, `.ts.net`, and the rest) — catches a caller that names the tailnet
+directly. It does not catch a caller that names something else. A hostname is not an address;
+it is a promise a resolver redeems later, and nothing stops that promise from being kept
+differently the second time. A name that resolves publicly when `/push/subscribe` checks it
+can be repointed at a tailnet address by the time the next cron failure fires — classic DNS
+rebinding, the same shape of bug the `Host` allowlist exists to close on the request side —
+and a name can simply resolve to more than one address, where only one of several is internal
+and nothing guarantees the connection lands on the one that was checked.
+
+So the literal-host rule at subscribe time is necessary but not sufficient, and the fix is a
+second check at the only point that is: `guardedLookup` installs a custom DNS resolution step
+on the `https.Agent` every delivery uses, judges every address a name resolves to — not just
+the first — and refuses to connect if any of them is internal. web-push's options do not
+expose a `lookup` hook directly, only `agent` and `timeout`, which is why this rides in on the
+agent rather than being a parameter of its own. The general shape is the same lesson as the
+`Host` allowlist: a value is not trustworthy just because it looked fine once, if what it
+actually controls is resolved again later.
+
 ## The bug that mattered most
 
 Sessions were originally created with `close_on_disconnect: true`. It was the right-looking

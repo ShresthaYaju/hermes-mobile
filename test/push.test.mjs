@@ -2,12 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import webpush from 'web-push';
 import { startProxy, startFakeHermes, rawGet, rawRequest } from './helpers.mjs';
-import { createNotifications, isDeliverableEndpoint } from '../notifications.mjs';
+import { createNotifications, isDeliverableEndpoint, guardedLookup } from '../notifications.mjs';
 
 // Generated per run rather than committed: a checked-in private key is a
 // credential, even a useless one.
@@ -35,6 +45,16 @@ const subscription = (endpoint) => ({
     auth: 'tBHItJI5svbpez7KI4CCXg',
   },
 });
+
+/** A syntactically valid, freshly-random key pair: correct decoded lengths and
+ * the 0x04 uncompressed-point prefix keysAreUsable now checks for, but not a
+ * real EC key -- nothing here decrypts with it, only shape-checks it. Used
+ * where a test needs "some other valid-looking key", distinct from the fixed
+ * dummy pair above. */
+function randomValidKeys() {
+  const p256dh = Buffer.concat([Buffer.from([0x04]), randomBytes(64)]);
+  return { p256dh: p256dh.toString('base64url'), auth: randomBytes(16).toString('base64url') };
+}
 
 test('push is reported unavailable when no VAPID keys are configured', async (t) => {
   const proxy = await startProxy();
@@ -126,6 +146,18 @@ const REJECTED = {
   'a 6to4-wrapped tailnet address': 'https://[2002:6440:101::]/x',
   'an IPv4-translated loopback': 'https://[::ffff:0:127.0.0.1]/x',
   'deprecated site-local IPv6': 'https://[fec0::1]/x',
+  // isInternalHost only ever judged IP literals until now, so a DNS name
+  // resolving somewhere on the tailnet -- another peer, or the host itself --
+  // walked straight past it. These are the literal-host layer; guardedLookup
+  // below is the second layer that catches a name repointed after the fact.
+  'a dotless hostname': 'https://hermes/x',
+  'a tailnet MagicDNS name': 'https://laptop.tailabc123.ts.net/x',
+  'an mDNS .local name': 'https://box.local/x',
+  'an .internal name': 'https://db.internal/x',
+  'a .home.arpa name': 'https://router.home.arpa/x',
+  'a .lan name': 'https://nas.lan/x',
+  'a .corp name': 'https://host.corp/x',
+  'a .home name': 'https://router.home/x',
 };
 
 test('the endpoint rule accepts public HTTPS and nothing else', () => {
@@ -151,7 +183,14 @@ test('the endpoint rule accepts public HTTPS and nothing else', () => {
 
 test('only deliverable endpoints are persisted', async (t) => {
   const stateDir = tempStateDir(t);
-  const proxy = await startProxy({ env: withVapid(stateDir) });
+  // One request per REJECTED case plus the accepted one, all from the same
+  // (unidentified/local) caller: comfortably past the default write-rate
+  // limit now that the internal-DNS-name cases live in this table too, so
+  // raise it rather than have the rate limiter -- not the rule under test --
+  // fail these requests instead.
+  const proxy = await startProxy({
+    env: { ...withVapid(stateDir), HERMES_MOBILE_WRITE_LIMIT: '200' },
+  });
   t.after(() => proxy.stop());
 
   const good = 'https://fcm.googleapis.com/fcm/send/good';
@@ -187,7 +226,15 @@ test('keys that cannot be encrypted with are refused', async (t) => {
   t.after(() => proxy.stop());
 
   const endpoint = 'https://fcm.googleapis.com/fcm/send/keys';
-  for (const keys of [{ p256dh: 1, auth: 'x' }, { auth: 'x' }, { p256dh: 'x'.repeat(300) }]) {
+  for (const keys of [
+    { p256dh: 1, auth: 'x' },
+    { auth: 'x' },
+    { p256dh: 'x'.repeat(300) },
+    // Two syntactically fine strings, short enough to pass the old
+    // length-only check, but neither decodes to a usable key: p256dh must be
+    // a 65-byte uncompressed P-256 point and auth at least 16 bytes.
+    { p256dh: 'ZZZ', auth: 'ZZZ' },
+  ]) {
     const response = await rawRequest(
       proxy.port,
       'POST',
@@ -280,7 +327,10 @@ test('a subscription cannot be taken over by re-subscribing to its endpoint', as
 
   const takeover = await rawRequest(proxy.port, 'POST', '/push/subscribe', identified(STRANGER), {
     endpoint,
-    keys: { p256dh: 'ZZZ', auth: 'ZZZ' },
+    // Valid-shaped and distinct from the owner's -- garbage keys would now be
+    // refused by keysAreUsable before this ever reaches the ownership check,
+    // which would test key validation instead of the takeover rule.
+    keys: randomValidKeys(),
   });
   // 204, the same as success: saying "that endpoint is held by someone else"
   // would answer a question the caller has no business asking.
@@ -388,7 +438,9 @@ test('push endpoints are handled locally and never forwarded to Hermes', async (
 /** A stub cron API whose job list the test can swap between polls. */
 async function fakeCron(initial) {
   let jobs = initial;
+  let requests = 0;
   const server = http.createServer((request, response) => {
+    requests += 1;
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify(jobs));
   });
@@ -398,6 +450,9 @@ async function fakeCron(initial) {
     origin: `http://127.0.0.1:${server.address().port}`,
     set: (next) => {
       jobs = next;
+    },
+    get requests() {
+      return requests;
     },
     async stop() {
       server.close();
@@ -412,7 +467,11 @@ function recordingDeliver() {
   return {
     sent,
     deliver: async (subscription, body) => {
-      sent.push({ endpoint: subscription.endpoint, payload: JSON.parse(body) });
+      sent.push({
+        endpoint: subscription.endpoint,
+        payload: JSON.parse(body),
+        bytes: Buffer.byteLength(body),
+      });
     },
   };
 }
@@ -521,10 +580,16 @@ test('a paused job is not treated as a failure', async (t) => {
 
 // A subscription that keeps failing used to be kept forever: only 404 and 410
 // reaped one, and every other status was treated as transient. So an endpoint
-// that had started answering 500 was retried on every tick for the life of the
+// that had started answering 403 was retried on every tick for the life of the
 // process, logging an error each time and burying the alerts that matter. One
 // failure is still not a verdict; ten in a row is, and a success in between
 // resets the count so a blip cannot accumulate.
+//
+// A second, always-succeeding subscription rides along for the whole test:
+// send() now only counts a failure when at least one *other* subscription got
+// through that tick (the count-none-if-everything-failed rule below), so with
+// only one subscription in play every tick would look like a fleet-wide
+// outage and the flaky one would never be counted at all.
 test('a subscription that fails persistently is eventually given up on', async (t) => {
   const stateDir = tempStateDir(t);
   process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
@@ -537,23 +602,30 @@ test('a subscription that fails persistently is eventually given up on', async (
   const cron = await fakeCron([{ id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z' }]);
   t.after(() => cron.stop());
 
+  const flaky = 'https://push.example/flaky';
+  const stable = 'https://push.example/stable';
   let failing = true;
   let attempts = 0;
   const notifications = createNotifications({
     hermesOrigin: cron.origin,
     sessionToken: '',
     stateDir,
-    deliver: async () => {
+    deliver: async (subscription) => {
+      if (subscription.endpoint !== flaky) return; // the sibling always succeeds
       attempts += 1;
-      // 500 is the "might be a blip" class. 404/410 reap immediately and are
-      // covered elsewhere; this is the status that used to be kept forever.
-      if (failing) throw Object.assign(new Error('upstream refused'), { statusCode: 500 });
+      // 403 is in the countable-4xx class: "our request, not their outage".
+      // 404/410 reap immediately and are covered elsewhere; 403 is the status
+      // that used to be lumped in with a 500 or a network error and kept
+      // forever.
+      if (failing) throw Object.assign(new Error('forbidden'), { statusCode: 403 });
     },
   });
-  notifications.addSubscription(subscription('https://push.example/flaky'), 'owner@example.com');
+  notifications.addSubscription(subscription(flaky), 'owner@example.com');
+  notifications.addSubscription(subscription(stable), 'other@example.com');
 
   const statePath = join(stateDir, 'push-state.json');
-  const stored = () => JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.length;
+  const flakyPresent = () =>
+    JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.some((s) => s.endpoint === flaky);
 
   // Each poll must see a *newly* failed job to send anything, so give it one.
   let tick = 0;
@@ -573,18 +645,652 @@ test('a subscription that fails persistently is eventually given up on', async (
 
   await notifications.poll(); // seeding pass: never replays existing state
   for (let i = 0; i < 9; i += 1) await failJobOnce();
-  assert.equal(stored(), 1, 'nine consecutive failures is not a verdict');
+  assert.equal(flakyPresent(), true, 'nine consecutive failures is not a verdict');
 
   failing = false;
   await failJobOnce();
   failing = true;
   for (let i = 0; i < 9; i += 1) await failJobOnce();
-  assert.equal(stored(), 1, 'a successful delivery must reset the streak');
+  assert.equal(flakyPresent(), true, 'a successful delivery must reset the streak');
 
   await failJobOnce();
-  assert.equal(stored(), 0, 'the tenth consecutive failure should drop it');
+  assert.equal(flakyPresent(), false, 'the tenth consecutive failure should drop it');
 
   const before = attempts;
   await failJobOnce();
   assert.equal(attempts, before, 'a dropped subscription is not retried');
+});
+
+test('transient transport failures with no statusCode never evict a subscription', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([{ id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z' }]);
+  t.after(() => cron.stop());
+
+  const first = 'https://push.example/one';
+  const second = 'https://push.example/two';
+  // A third, always-succeeding sibling: without it, every subscription in the
+  // tick fails and the "count none if everything failed" rule alone would
+  // protect first/second regardless of whether a no-statusCode error is
+  // separately excluded from counting. With a success present every tick,
+  // this test isolates that second rule instead.
+  const stable = 'https://push.example/stable';
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    // ENOTFOUND/ECONNREFUSED/a timeout carry no statusCode at all -- that is
+    // our link being down, not a verdict on either endpoint.
+    deliver: async (subscription) => {
+      if (subscription.endpoint === stable) return;
+      throw Object.assign(new Error('getaddrinfo ENOTFOUND push.example'), {});
+    },
+  });
+  notifications.addSubscription(subscription(first), 'owner-a@example.com');
+  notifications.addSubscription(subscription(second), 'owner-b@example.com');
+  notifications.addSubscription(subscription(stable), 'owner-c@example.com');
+
+  const statePath = join(stateDir, 'push-state.json');
+  const endpoints = () =>
+    JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.map((s) => s.endpoint);
+
+  let tick = 0;
+  const failJobOnce = async () => {
+    tick += 1;
+    cron.set([
+      {
+        id: 'a',
+        name: 'Job A',
+        last_run_at: `2026-01-01T00:00:${String(tick).padStart(2, '0')}Z`,
+        last_status: 'error',
+        last_error: `boom ${tick}`,
+      },
+    ]);
+    await notifications.poll();
+  };
+
+  await notifications.poll(); // seeding
+  for (let i = 0; i < 10; i += 1) await failJobOnce();
+  assert.deepEqual(
+    endpoints().sort(),
+    [first, second, stable].sort(),
+    'ten straight network-level failures must not evict either owner, success elsewhere notwithstanding',
+  );
+});
+
+test('a 403 evicts only the subscription it belongs to, not a healthy sibling', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([{ id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z' }]);
+  t.after(() => cron.stop());
+
+  const bad = 'https://push.example/bad';
+  const good = 'https://push.example/good';
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver: async (subscription) => {
+      if (subscription.endpoint === bad) {
+        throw Object.assign(new Error('forbidden'), { statusCode: 403 });
+      }
+    },
+  });
+  notifications.addSubscription(subscription(bad), 'owner-a@example.com');
+  notifications.addSubscription(subscription(good), 'owner-b@example.com');
+
+  const statePath = join(stateDir, 'push-state.json');
+  const endpoints = () =>
+    JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.map((s) => s.endpoint);
+
+  let tick = 0;
+  const failJobOnce = async () => {
+    tick += 1;
+    cron.set([
+      {
+        id: 'a',
+        name: 'Job A',
+        last_run_at: `2026-01-01T00:00:${String(tick).padStart(2, '0')}Z`,
+        last_status: 'error',
+        last_error: `boom ${tick}`,
+      },
+    ]);
+    await notifications.poll();
+  };
+
+  await notifications.poll(); // seeding
+  for (let i = 0; i < 10; i += 1) await failJobOnce();
+  assert.deepEqual(endpoints(), [good], 'only the endpoint answering 403 should be dropped');
+});
+
+// A statusCode that would otherwise be countable (see the test above) must
+// not count when *every* subscription got it this tick: that is a fault this
+// host caused -- a broken VAPID key, say -- not a verdict on any one endpoint,
+// and would otherwise evict the entire fleet in lockstep, exactly as fast as
+// one genuinely broken subscription.
+test('a status shared by every subscription in a tick evicts none of them', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([{ id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z' }]);
+  t.after(() => cron.stop());
+
+  const first = 'https://push.example/one';
+  const second = 'https://push.example/two';
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver: async () => {
+      throw Object.assign(new Error('forbidden'), { statusCode: 403 });
+    },
+  });
+  notifications.addSubscription(subscription(first), 'owner-a@example.com');
+  notifications.addSubscription(subscription(second), 'owner-b@example.com');
+
+  const statePath = join(stateDir, 'push-state.json');
+  const endpoints = () =>
+    JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.map((s) => s.endpoint);
+
+  let tick = 0;
+  const failJobOnce = async () => {
+    tick += 1;
+    cron.set([
+      {
+        id: 'a',
+        name: 'Job A',
+        last_run_at: `2026-01-01T00:00:${String(tick).padStart(2, '0')}Z`,
+        last_status: 'error',
+        last_error: `boom ${tick}`,
+      },
+    ]);
+    await notifications.poll();
+  };
+
+  await notifications.poll(); // seeding
+  for (let i = 0; i < 10; i += 1) await failJobOnce();
+  assert.deepEqual(
+    endpoints().sort(),
+    [first, second].sort(),
+    'a 403 shared by the whole fleet must not evict anyone',
+  );
+});
+
+// guardedLookup is the second, resolved-address layer behind isDeliverableEndpoint:
+// a hostname can look public at subscribe time and still resolve into the
+// tailnet, either because DNS was rebound afterward or because it always had
+// more than one address and only some of them are internal. web-push has no
+// `lookup` option of its own, so this is threaded in through an https.Agent
+// instead -- these tests exercise the exported factory directly, with a fake
+// resolver standing in for dns.lookup.
+test('guardedLookup refuses a hostname that resolves to a tailnet address', () => {
+  const fakeResolver = (hostname, options, callback) => {
+    assert.equal(hostname, 'push.example.com');
+    assert.equal(options.all, true, 'must always ask for every address, not just the first');
+    callback(null, [{ address: '100.100.1.1', family: 4 }]);
+  };
+  const lookup = guardedLookup(fakeResolver);
+
+  let result;
+  lookup('push.example.com', {}, (error, address) => {
+    result = { error, address };
+  });
+  assert.ok(result.error, 'a tailnet CGNAT address must fail the lookup');
+});
+
+test('guardedLookup refuses a hostname when only one of several resolved addresses is internal', () => {
+  const fakeResolver = (hostname, options, callback) => {
+    callback(null, [
+      { address: '203.0.113.7', family: 4 },
+      { address: '169.254.169.254', family: 4 },
+    ]);
+  };
+  const lookup = guardedLookup(fakeResolver);
+
+  let result;
+  lookup('push.example.com', {}, (error) => {
+    result = error;
+  });
+  assert.ok(result, 'one internal address among several must still refuse the whole lookup');
+});
+
+test('guardedLookup passes through a hostname that resolves publicly', () => {
+  const fakeResolver = (hostname, options, callback) => {
+    callback(null, [{ address: '203.0.113.7', family: 4 }]);
+  };
+  const lookup = guardedLookup(fakeResolver);
+
+  let result;
+  lookup('push.example.com', {}, (error, address, family) => {
+    result = { error, address, family };
+  });
+  assert.equal(result.error, null);
+  assert.equal(result.address, '203.0.113.7');
+  assert.equal(result.family, 4);
+});
+
+test('guardedLookup propagates a resolver error rather than swallowing it', () => {
+  const fakeResolver = (hostname, options, callback) => {
+    callback(new Error('getaddrinfo ENOTFOUND'));
+  };
+  const lookup = guardedLookup(fakeResolver);
+
+  let result;
+  lookup('push.example.com', {}, (error) => {
+    result = error;
+  });
+  assert.match(result.message, /ENOTFOUND/);
+});
+
+// A corrupt or truncated state file used to be swallowed by a bare `catch {}`:
+// nothing was logged, and the next write could clobber a file that might
+// still have been recoverable by hand. It should be reported instead -- and,
+// separately, an unrelated poll that changes nothing must not needlessly
+// rewrite the (now-reset) state file on every tick.
+test('a corrupted state file is reported rather than silently discarded, and unrelated polls do not rewrite it', async (t) => {
+  const stateDir = tempStateDir(t);
+  const statePath = join(stateDir, 'push-state.json');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(statePath, '{ this is not valid json');
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(' '));
+  t.after(() => {
+    console.warn = originalWarn;
+  });
+
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([
+    { id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+  });
+  assert.ok(
+    warnings.some((w) => w.includes(statePath)),
+    'a corrupt state file must be reported, not swallowed silently',
+  );
+
+  await notifications.poll(); // seeding: a real change, may legitimately write
+  const contentAfterSeed = readFileSync(statePath, 'utf8');
+  const mtimeAfterSeed = statSync(statePath).mtimeMs;
+
+  // No wall-clock wait needed between the two polls: save() uses writeFileSync
+  // and renameSync, both synchronous, so if the second poll below were to
+  // write at all, that write is already complete by the time the awaited
+  // poll() call returns -- there is no async gap for a delay to bridge.
+  await notifications.poll(); // nothing changed this time
+  assert.equal(
+    readFileSync(statePath, 'utf8'),
+    contentAfterSeed,
+    'an unchanged poll must not rewrite the state file',
+  );
+  assert.equal(
+    statSync(statePath).mtimeMs,
+    mtimeAfterSeed,
+    'and must not touch the file at all -- every tick used to save unconditionally',
+  );
+});
+
+// A free-text job name is the one field in a notification with no natural
+// bound, and used to be sent verbatim. That produces a payload most push
+// services reject outright (413), which the failure accounting in send() now
+// correctly counts against the subscription as a real fault, so an oversized
+// name would evict every subscriber's device for no fault of theirs.
+test('an oversized job name is bounded rather than sent as a giant payload', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const hugeName = 'x'.repeat(50_000);
+  const cron = await fakeCron([
+    { id: 'a', name: hugeName, last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'));
+  await notifications.poll(); // seeding
+
+  cron.set([
+    {
+      id: 'a',
+      name: hugeName,
+      last_run_at: '2026-01-02T00:00:00Z',
+      last_status: 'error',
+      last_error: 'boom',
+    },
+  ]);
+  await notifications.poll();
+
+  assert.equal(sent.length, 1, 'delivery must still be attempted, just with a bounded payload');
+  assert.ok(sent[0].bytes <= 3800, `payload was ${sent[0].bytes} bytes`);
+});
+
+// The deep-link url is deliberately left uncapped by the title/tag shortening
+// above -- truncating a job id would break the link -- so it is the one field
+// that can still blow the budget even with a short name. send()'s own
+// byte-length check is what catches that case, independent of the title/tag
+// caps: a huge id makes a huge encodeURIComponent(id) inside the url with
+// nothing else in the payload construction to stop it.
+test('send() falls back to a minimal payload when the url alone makes it oversized', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const hugeId = 'x'.repeat(50_000);
+  const cron = await fakeCron([
+    { id: hugeId, last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'));
+  await notifications.poll(); // seeding
+
+  cron.set([
+    { id: hugeId, last_run_at: '2026-01-02T00:00:00Z', last_status: 'error', last_error: 'boom' },
+  ]);
+  await notifications.poll();
+
+  assert.equal(sent.length, 1, 'delivery must still be attempted, just with a bounded payload');
+  assert.ok(sent[0].bytes <= 3800, `payload was ${sent[0].bytes} bytes`);
+});
+
+// job.id is used as an object key when tracking which failures have already
+// been notified about. `__proto__` is not an ordinary key on a plain object --
+// assigning it does not create an own property at all, since the assignment
+// runs into the inherited accessor of the same name -- so a job with that id
+// either never got recorded (seeding looked permanently incomplete) or the
+// signature never matched (a notification on every single tick).
+test('a job id of __proto__ does not break the signature map', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([
+    {
+      id: '__proto__',
+      name: 'Weird Job',
+      last_run_at: '2026-01-01T00:00:00Z',
+      last_status: 'error',
+      last_error: 'boom',
+    },
+  ]);
+  t.after(() => cron.stop());
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'));
+
+  await notifications.poll(); // seeding pass: must not replay the pre-existing failure
+  assert.equal(sent.length, 0);
+
+  cron.set([
+    {
+      id: '__proto__',
+      name: 'Weird Job',
+      last_run_at: '2026-01-02T00:00:00Z',
+      last_status: 'error',
+      last_error: 'new failure',
+    },
+  ]);
+  for (let i = 0; i < 5; i += 1) await notifications.poll();
+  assert.equal(sent.length, 1, 'exactly one notification across five polls after the change');
+});
+
+// Without a re-entrancy guard, a delivery slow enough to still be in flight
+// when the next interval fires would run two ticks concurrently against the
+// same subscriptions.
+test('an in-flight poll makes a concurrent poll a no-op', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([
+    { id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  let deliverCalls = 0;
+  let releaseHang;
+  let notifyStarted;
+  const hang = new Promise((resolve) => {
+    releaseHang = resolve;
+  });
+  // fetchJobs() is a real HTTP round-trip to the fake cron server, so the
+  // first poll() has not necessarily reached delivery yet just because it has
+  // been called -- wait for delivery to actually start before racing the
+  // second poll() against it, rather than assuming the timing.
+  const started = new Promise((resolve) => {
+    notifyStarted = resolve;
+  });
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver: async () => {
+      deliverCalls += 1;
+      notifyStarted();
+      await hang;
+    },
+  });
+  notifications.addSubscription(subscription('https://push.example/device'));
+  await notifications.poll(); // seeding: no deliveries yet
+
+  cron.set([
+    {
+      id: 'a',
+      name: 'Job A',
+      last_run_at: '2026-01-02T00:00:00Z',
+      last_status: 'error',
+      last_error: 'boom',
+    },
+  ]);
+  const first = notifications.poll(); // hangs inside deliver
+  await started;
+  // state.signatures is already updated by the time send() is reached, so a
+  // second poll for the *same* failure would find nothing new to notify about
+  // regardless of the guard -- that alone would not tell the two cases apart.
+  // Whether fetchJobs() was even called a second time does: the guard's job
+  // is to make the whole tick, not just delivery, a no-op.
+  const requestsBeforeOverlap = cron.requests;
+  await notifications.poll(); // must return immediately without starting a second tick
+  assert.equal(
+    cron.requests,
+    requestsBeforeOverlap,
+    'an overlapping poll must not even re-fetch the job list, let alone re-deliver',
+  );
+  assert.equal(
+    deliverCalls,
+    1,
+    'an overlapping poll must not run concurrently with one already in flight',
+  );
+
+  releaseHang();
+  await first; // let the hung delivery finish so nothing is left dangling
+});
+
+// The global cap used to slice(-MAX_SUBSCRIPTIONS) across every identity, so
+// the globally-oldest entry -- which could belong to anyone -- was evicted to
+// make room for a new one. That let one identity filling its own quota bump a
+// completely unrelated identity's device. It should refuse the new add
+// instead.
+test('the global subscription cap refuses a new device rather than evicting another identity', async (t) => {
+  const stateDir = tempStateDir(t);
+  const owners = [
+    'owner-a@example.com',
+    'owner-b@example.com',
+    'owner-c@example.com',
+    'owner-d@example.com',
+  ];
+  const proxy = await startProxy({
+    env: {
+      ...withVapid(stateDir),
+      HERMES_MOBILE_ALLOWED_LOGINS: [...owners, 'owner-e@example.com'].join(','),
+      HERMES_MOBILE_ALLOW_LOCAL: '',
+      HERMES_MOBILE_WRITE_LIMIT: '200',
+    },
+  });
+  t.after(() => proxy.stop());
+
+  const statePath = join(stateDir, 'push-state.json');
+  const endpoints = () =>
+    JSON.parse(readFileSync(statePath, 'utf8')).subscriptions.map((s) => s.endpoint);
+  const earliest = `https://fcm.googleapis.com/fcm/send/${owners[0]}-0`;
+
+  // Four identities at their five-device-each cap: exactly MAX_SUBSCRIPTIONS.
+  for (const owner of owners) {
+    for (let device = 0; device < 5; device += 1) {
+      const endpoint = `https://fcm.googleapis.com/fcm/send/${owner}-${device}`;
+      const response = await rawRequest(
+        proxy.port,
+        'POST',
+        '/push/subscribe',
+        identified(owner),
+        subscription(endpoint),
+      );
+      assert.equal(response.status, 204);
+    }
+  }
+  assert.equal(endpoints().length, 20, 'the global cap should be exactly full');
+  assert.ok(endpoints().includes(earliest));
+
+  const refused = await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    identified('owner-e@example.com'),
+    subscription('https://fcm.googleapis.com/fcm/send/owner-e-0'),
+  );
+  assert.equal(refused.status, 400, 'a new device once the cap is full must be refused');
+  assert.equal(endpoints().length, 20, 'nothing was evicted to make room');
+  assert.ok(
+    endpoints().includes(earliest),
+    'the earliest entry, belonging to a different identity, is untouched',
+  );
+});
+
+// Versions before endpoints and keys were validated could have persisted
+// entries this code would now refuse, or fields it never wrote itself. load()
+// used to trust the file outright; it should re-run the same checks
+// addSubscription applies to a fresh POST.
+test('load re-validates stored subscriptions: unusable ones are dropped, unknown fields are stripped', async (t) => {
+  const stateDir = tempStateDir(t);
+  const statePath = join(stateDir, 'push-state.json');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      subscriptions: [
+        {
+          endpoint: 'https://fcm.googleapis.com/fcm/send/good',
+          keys: subscription('irrelevant').keys,
+          owner: null,
+          injectedByAnOlderVersionOrByHand: 'should not survive',
+        },
+        {
+          endpoint: 'https://fcm.googleapis.com/fcm/send/oversized-key',
+          keys: { p256dh: 'ZZZ', auth: 'ZZZ' },
+          owner: null,
+        },
+      ],
+      signatures: {},
+      seeded: true,
+    }),
+  );
+
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  createNotifications({ hermesOrigin: 'http://127.0.0.1:1', sessionToken: '', stateDir });
+
+  const state = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.equal(state.subscriptions.length, 1, 'the entry with an unusable key must be dropped');
+  assert.equal(state.subscriptions[0].endpoint, 'https://fcm.googleapis.com/fcm/send/good');
+  assert.deepEqual(
+    Object.keys(state.subscriptions[0]).sort(),
+    ['endpoint', 'keys', 'owner'],
+    'a field this code never wrote must not survive a load',
+  );
+});
+
+test('load repairs the state directory permissions even before anything is written', async (t) => {
+  const stateDir = tempStateDir(t);
+  chmodSync(stateDir, 0o770);
+
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  createNotifications({ hermesOrigin: 'http://127.0.0.1:1', sessionToken: '', stateDir });
+  assert.equal(statSync(stateDir).mode & 0o777, 0o700);
 });
