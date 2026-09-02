@@ -119,8 +119,8 @@ repository.
 | `HERMES_MOBILE_ALLOWED_ORIGINS` | *(none)* | Extra browser origins permitted, comma separated. Only needed when the app is served from one hostname and reached by another. |
 | `HERMES_MOBILE_ALLOWED_HOSTS` | loopback, `*.ts.net`, `100.64.0.0/10` | Extra `Host` values this proxy will answer for, comma separated. The defaults cover local use and `tailscale serve`; you need this only if you front the app with some other name. |
 | `HERMES_MOBILE_READ_TIMEOUT` | `30000` | Milliseconds a read waits on Hermes before giving up, answering 502. Reads only: a write can legitimately run the agent for minutes, and the WebSocket is long-lived by design. `0` waits forever. |
-| `HERMES_MOBILE_WRITE_LIMIT` | `30` | Writes allowed per identity per minute. `0` refuses writes entirely. A value that does not parse as a number refuses to start rather than silently becoming one write per minute. |
-| `HERMES_MOBILE_STATE_DIR` | `$XDG_STATE_HOME/hermes-mobile`, else `~/.local/state/hermes-mobile` | Where the push subscription file is kept. Written `0600`. |
+| `HERMES_MOBILE_WRITE_LIMIT` | `30` | Writes allowed per identity per minute. A WebSocket upgrade spends one unit too, since its method surface is a superset of any REST write's — so `0` refuses writes *and* the chat socket, making the app read-only. A value that does not parse as a number refuses to start rather than silently becoming one write per minute. |
+| `HERMES_MOBILE_STATE_DIR` | `$XDG_STATE_HOME/hermes-mobile`, else `~/.local/state/hermes-mobile` | Where the push subscription file is kept. Written `0600`. The shipped `hermes-mobile-pwa.service` sandboxes the process with `ProtectSystem=strict` and only grants write access to `~/.local/state/hermes-mobile` via `ReadWritePaths=`; override this variable *and* that line together, or writes will silently fail under the unit even though they work from a shell. |
 | `HERMES_MOBILE_ALLOW_PUBLIC_BIND` | off | `1` overrides the refusal to bind a non-loopback address. **Do not set this** unless you have put real authentication in front of the app; see [SECURITY.md](SECURITY.md). Note that the identity header is still refused off a non-loopback socket, so a fronting proxy has to run on this same host. |
 | `HERMES_MOBILE_VAPID_PUBLIC_KEY` | *(none)* | Web Push. Absent, push is off and Config says so. |
 | `HERMES_MOBILE_VAPID_PRIVATE_KEY` | *(none)* | Web Push. Keep it in the `0600` env file and nowhere else. |
@@ -190,7 +190,7 @@ tailscale serve reset
 
 - `POST /api/model/set` **is** exposed, scoped to the main model slot. The same upstream endpoint can also write per-task auxiliary pins, a provider `base_url` and an API key into `config.yaml`. A proxy cannot inspect request bodies, so what keeps those off the phone is that no client here composes them — `public/lib/api.js` sends a main-slot assignment and nothing else, and a source-level test pins that. Treat it as a constraint to preserve, not a boundary the proxy enforces.
 
-- Push subscription endpoints are capability URLs and are stored `0600` outside the repo.
+- Push subscription endpoints are capability URLs and are stored `0600` outside the repo. Each one is checked twice against reaching back into the tailnet or the host itself: the literal host is refused at `/push/subscribe` if it is obviously internal, and the resolved address is refused again on every delivery attempt, which is what still catches a name that looked public when accepted and was repointed afterward. See [SECURITY.md](SECURITY.md) for the detail.
 
 - The service listens on `127.0.0.1`; HTTPS and tailnet authentication are provided by Tailscale Serve. Use `tailscale serve`, never `tailscale funnel` — funnel publishes it to the public internet.
 

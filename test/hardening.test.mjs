@@ -17,6 +17,13 @@ import assert from 'node:assert/strict';
 import { startProxy, startFakeHermes, rawGet, rawRequest, rawUpgrade } from './helpers.mjs';
 import http from 'node:http';
 import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const OWNER = 'yaju@example.com';
 const EVIL_HOST = 'evil.example.com';
@@ -499,5 +506,363 @@ test('a read timeout that does not parse refuses to start', async () => {
     assert.fail('the server should not have started');
   } catch (error) {
     assert.match(error.message, /HERMES_MOBILE_READ_TIMEOUT=soon/);
+  }
+});
+
+// Round three: the socket had no audit line and no budget, the internal hop
+// forwarded whatever headers the client happened to send, a wider read
+// exclusion bypass than the one already closed, a same-origin check that a
+// no-cors subresource load could slip past with no Origin at all, three
+// responses that answered without the security headers every other one
+// carries, and upstream's own Cache-Control surviving onto an authenticated
+// response.
+
+test('an accepted WebSocket upgrade is audited with the identity that opened it', async (t) => {
+  const { proxy } = await proxyFor(t, { env: strictEnv, token: 'secret-token' });
+
+  // The socket used to be the one path that reached the agent with no record
+  // of who opened it -- despite its method surface including shell.exec.
+  await rawUpgrade(proxy.port, '/api/ws', identified());
+  // Give the child a moment to flush its stdout.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const lines = proxy
+    .stdout()
+    .split('\n')
+    .filter((line) => line.includes('"audit"'))
+    .map((line) => JSON.parse(line));
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].audit, 'upgrade');
+  assert.equal(lines[0].login, IDENTITY);
+  assert.equal(lines[0].method, 'GET');
+  assert.equal(lines[0].path, '/api/ws');
+});
+
+test('a WebSocket upgrade spends the same write budget a REST write does', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, {
+    env: { ...strictEnv, HERMES_MOBILE_WRITE_LIMIT: '1' },
+    token: 'secret-token',
+  });
+
+  await rawUpgrade(proxy.port, '/api/ws', identified());
+  assert.equal(hermes.upgrades.length, 1, 'the first upgrade is within the budget');
+
+  // A script that reconnects in a loop is exactly what the budget exists to
+  // bound, and the socket used to be exempt from it entirely.
+  await rawUpgrade(proxy.port, '/api/ws', identified());
+  assert.equal(hermes.upgrades.length, 1, 'the second must not reach the gateway');
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const outcomes = proxy
+    .stdout()
+    .split('\n')
+    .filter((line) => line.includes('"audit"'))
+    .map((line) => JSON.parse(line).audit);
+  assert.deepEqual(outcomes, ['upgrade', 'rate-limited']);
+});
+
+test('headers the client did not need to send do not reach the internal hop', async (t) => {
+  const { hermes, proxy } = await proxyFor(t);
+
+  const response = await rawRequest(proxy.port, 'GET', '/api/status', {
+    'Content-Type': 'application/json',
+    'X-Original-URL': '/api/env/reveal',
+    'X-Http-Method-Override': 'DELETE',
+    Forwarded: 'for=1.2.3.4',
+    'X-Real-Ip': '1.2.3.4',
+    'Tailscale-User-Name': 'Someone',
+    'Tailscale-User-Profile-Pic': 'https://example.com/x.png',
+    Cookie: 'session=forged',
+    Authorization: 'Bearer forged',
+  });
+
+  assert.equal(response.status, 200);
+  const { headers } = hermes.requests[0];
+  for (const name of [
+    'x-original-url',
+    'x-http-method-override',
+    'forwarded',
+    'x-real-ip',
+    'tailscale-user-name',
+    'tailscale-user-profile-pic',
+    'cookie',
+    'authorization',
+  ]) {
+    assert.equal(headers[name], undefined, `${name} must not reach Hermes`);
+  }
+  // Named, not merely un-blocked: the allowlist has to let the ordinary
+  // traffic through, not just keep out what it was written to keep out.
+  assert.equal(headers['content-type'], 'application/json');
+});
+
+test('the same allowlist applies to the WebSocket handshake', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { token: 'secret-token' });
+
+  await rawUpgrade(proxy.port, '/api/ws', {
+    'X-Original-URL': '/api/pty',
+    Forwarded: 'for=1.2.3.4',
+    'X-Real-Ip': '1.2.3.4',
+    'Tailscale-User-Name': 'Someone',
+    Cookie: 'session=forged',
+    Authorization: 'Bearer forged',
+  });
+
+  assert.equal(hermes.upgrades.length, 1, 'the handshake itself must still succeed');
+  const { headers } = hermes.upgrades[0];
+  for (const name of [
+    'x-original-url',
+    'forwarded',
+    'x-real-ip',
+    'tailscale-user-name',
+    'cookie',
+    'authorization',
+  ]) {
+    assert.equal(headers[name], undefined, `${name} must not reach the gateway`);
+  }
+  assert.ok(headers['sec-websocket-key'], 'the handshake itself must still arrive');
+  assert.equal(headers['sec-websocket-version'], '13');
+});
+
+test('a doubled or trailing slash before the action name is refused outright', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // No route this proxy knows has an empty path segment, so this is refused
+  // before it can change which segment the exclusion below reads as "last".
+  const response = await rawGet(proxy.port, '/api/cron/jobs/x/trigger//', identified());
+
+  assert.equal(response.status, 400);
+  assert.equal(hermes.requests.length, 0);
+});
+
+test('a matrix-parameter suffix and a decoded trailing space do not escape the exclusion', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv });
+
+  // Neither spelling is anywhere close to exotic: `;a` is an ordinary matrix
+  // parameter and `%20` is an ordinary encoded space, and upstream still
+  // routes both of these to the trigger action. The old exclusion matched the
+  // literal suffix `trigger` or `trigger/` only, so both read as a plain,
+  // unaudited, unmetered read under /api/cron/jobs.
+  for (const path of ['/api/cron/jobs/x/trigger;a', '/api/cron/jobs/x/trigger%20']) {
+    const response = await rawGet(proxy.port, path, identified());
+    assert.equal(response.status, 404, `GET ${path} must not read as a read`);
+  }
+  assert.equal(hermes.requests.length, 0);
+});
+
+test('Sec-Fetch-Site is refused even though a no-cors load never sends Origin', async (t) => {
+  const { hermes, proxy } = await proxyFor(t);
+
+  // `<img src>` and `<script src>` issue a no-cors GET with no Origin header
+  // at all, so "Origin is missing" was never proof the caller was not a
+  // browser. Sec-Fetch-Site is: the browser sets it and a page cannot forge
+  // or suppress it either.
+  const crossSite = await rawGet(proxy.port, '/api/sessions', { 'Sec-Fetch-Site': 'cross-site' });
+  assert.equal(crossSite.status, 403, 'cross-site must be refused though Origin is absent');
+
+  const sameSite = await rawGet(proxy.port, '/api/sessions', { 'Sec-Fetch-Site': 'same-site' });
+  assert.equal(sameSite.status, 403);
+
+  const sameOrigin = await rawGet(proxy.port, '/api/sessions', {
+    'Sec-Fetch-Site': 'same-origin',
+  });
+  assert.equal(sameOrigin.status, 200, 'same-origin must still be admitted');
+
+  assert.equal(hermes.requests.length, 1);
+});
+
+test('Sec-Fetch-Site refuses a cross-site WebSocket upgrade the same way', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { token: 'secret-token' });
+
+  const result = await rawUpgrade(proxy.port, '/api/ws', { 'Sec-Fetch-Site': 'cross-site' });
+
+  assert.notEqual(result.outcome, 'upgraded');
+  assert.equal(hermes.upgrades.length, 0, 'no cross-site upgrade may reach the gateway');
+});
+
+test('a static 404 and a malformed static path still carry the security headers', async (t) => {
+  const { proxy } = await proxyFor(t);
+
+  // These two answered with none of them: no CSP, no X-Content-Type-Options
+  // -- the exact protections every other response on this proxy carries.
+  const notFound = await rawGet(proxy.port, '/nope');
+  assert.equal(notFound.status, 404);
+  assert.equal(notFound.headers['x-content-type-options'], 'nosniff');
+  assert.ok(notFound.headers['content-security-policy']);
+
+  const malformed = await rawGet(proxy.port, '/%');
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.headers['x-content-type-options'], 'nosniff');
+  assert.ok(malformed.headers['content-security-policy']);
+});
+
+test('an authenticated /api response is never cached, even if Hermes says otherwise', async (t) => {
+  // A stand-in that answers like an upstream that wants its own response
+  // cached -- unlike startFakeHermes(), which never sets Cache-Control at
+  // all and so could not have caught http-proxy copying one through.
+  const upstream = http.createServer((request, response) => {
+    response.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    });
+    response.end(JSON.stringify({ ok: true }));
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  const proxy = await startProxy({ hermesOrigin: `http://127.0.0.1:${upstream.address().port}` });
+  t.after(async () => {
+    await proxy.stop();
+    upstream.close();
+  });
+
+  const response = await rawGet(proxy.port, '/api/status');
+
+  assert.equal(response.status, 200);
+  // A transcript or a session list has no business surviving in the phone's
+  // HTTP cache -- it would still be readable there after the login that
+  // fetched it left the allowlist. Setting the header before proxy.web()
+  // runs is not enough by itself: http-proxy copies every header the
+  // upstream response sent, Cache-Control included, onto this one.
+  assert.equal(response.headers['cache-control'], 'no-store');
+});
+
+// Round four: the upgrade gate lacked the encoded-separator check the request
+// gate has, refusals warned unconditionally and could flood the journal from
+// a single unauthenticated address, and a live WebSocket held server.close()
+// open indefinitely.
+
+test('the upgrade gate refuses an encoded path separator before identity has any say', async (t) => {
+  const { hermes, proxy } = await proxyFor(t, { env: strictEnv, token: 'secret-token' });
+
+  // The canonical encoded separator, same as the HTTP-side regression test.
+  // The exact-match check just below already refuses this either way -- which
+  // is exactly the point: this closes the gap on its own terms rather than
+  // relying on that match staying exact forever.
+  const result = await rawUpgrade(proxy.port, '/api/%2fws', identified());
+
+  assert.notEqual(result.outcome, 'upgraded');
+  assert.equal(hermes.upgrades.length, 0);
+  // The exact-match refusal further down is silent; only this new check logs
+  // a reason, so its presence is what distinguishes "refused here" from
+  // "refused down there anyway".
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.match(proxy.stderr(), /encoded path separator/);
+});
+
+test('refusal warnings are throttled per remote address, with a suppression summary', async (t) => {
+  const { hermes, proxy } = await proxyFor(t);
+
+  // All 50 arrive from the same loopback address, which is exactly the
+  // scenario the throttle exists for: one unauthenticated peer in a loop.
+  await Promise.all(Array.from({ length: 50 }, () => rawGet(proxy.port, '/api/status', rebound)));
+  // Let the debounced summary flush.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const lines = proxy
+    .stderr()
+    .split('\n')
+    .filter((line) => line.includes('Refused') || line.includes('Suppressed'));
+
+  assert.ok(lines.length <= 21, `expected at most ~21 lines, got ${lines.length}`);
+  assert.ok(
+    lines.some((line) => line.includes('Suppressed')),
+    'expected a suppression summary line',
+  );
+  assert.equal(hermes.requests.length, 0, 'none of the 50 may reach Hermes');
+});
+
+// This one runs the whole scenario -- spawn the proxy, hold a raw upgraded
+// socket open against it, SIGTERM it, time the exit -- inside a *second*
+// subprocess rather than this test's own process. Holding a live socket to a
+// child this process also signals confuses node:test's own bookkeeping (a
+// spurious "cancelledByParent" unrelated to the proxy, reproducible even with
+// the assertion passing in well under a second); a throwaway wrapper script
+// sidesteps that entirely and is otherwise exactly the repro.
+test('SIGTERM exits promptly even with a live WebSocket open', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hermes-mobile-sigterm-'));
+  const scriptPath = join(dir, 'repro.mjs');
+  try {
+    writeFileSync(
+      scriptPath,
+      `
+      import { spawn } from 'node:child_process';
+      import { once } from 'node:events';
+      import http from 'node:http';
+      import net from 'node:net';
+
+      // Completes the handshake and, deliberately, never closes the socket --
+      // the same shape a real chat session left open holds.
+      const upstream = http.createServer();
+      upstream.on('upgrade', (request, socket) => {
+        socket.write('HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\n\\r\\n');
+      });
+      upstream.listen(0, '127.0.0.1');
+      await once(upstream, 'listening');
+
+      const child = spawn(process.execPath, ['server.mjs'], {
+        cwd: ${JSON.stringify(repoRoot)},
+        env: {
+          ...process.env,
+          HOST: '127.0.0.1',
+          PORT: '0',
+          HERMES_ORIGIN: 'http://127.0.0.1:' + upstream.address().port,
+          HERMES_DASHBOARD_SESSION_TOKEN: 'secret-token',
+          HERMES_MOBILE_VAPID_PUBLIC_KEY: '',
+          HERMES_MOBILE_VAPID_PRIVATE_KEY: '',
+          HERMES_MOBILE_ALLOW_LOCAL: '1',
+        },
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+
+      child.stdout.setEncoding('utf8');
+      let buffered = '';
+      const port = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('server did not start in time')), 10000);
+        child.stdout.on('data', (chunk) => {
+          buffered += chunk;
+          const match = buffered.match(/listening on http:\\/\\/127\\.0\\.0\\.1:(\\d+)/);
+          if (match) {
+            clearTimeout(timer);
+            resolve(Number(match[1]));
+          }
+        });
+      });
+
+      // Deliberately not a client that destroys its own socket the instant
+      // the 101 arrives -- that would tear the connection down before SIGTERM
+      // ever gets a chance to matter.
+      const clientSocket = net.createConnection({ host: '127.0.0.1', port });
+      await new Promise((resolve) => clientSocket.once('connect', resolve));
+      clientSocket.write(
+        'GET /api/ws HTTP/1.1\\r\\nHost: 127.0.0.1:' + port +
+          '\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\n' +
+          'Sec-WebSocket-Key: MC0xLTItMy00LTUtNi03LTgtOQ==\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n',
+      );
+      await new Promise((resolve) => clientSocket.once('data', resolve));
+
+      const started = Date.now();
+      child.kill('SIGTERM');
+      const withinDeadline = await Promise.race([
+        once(child, 'exit').then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+      ]);
+      console.log('RESULT ' + withinDeadline + ' ' + (Date.now() - started));
+      clientSocket.destroy();
+      upstream.close();
+      process.exit(0);
+      `,
+    );
+
+    const result = spawnSync(process.execPath, [scriptPath], { encoding: 'utf8', timeout: 10000 });
+    const match = result.stdout.match(/RESULT (true|false) (\d+)/);
+
+    assert.ok(match, `expected a RESULT line; stdout=${result.stdout} stderr=${result.stderr}`);
+    assert.equal(
+      match[1],
+      'true',
+      `SIGTERM must exit within 3s, not wait for SIGKILL (still running after ${match[2]}ms)`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

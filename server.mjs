@@ -5,6 +5,21 @@ import process from 'node:process';
 import httpProxy from 'http-proxy-3';
 import { createNotifications } from './notifications.mjs';
 
+// Node's defaults for these are not what a service managed by systemd wants:
+// an unhandled rejection only warns and keeps running, possibly half broken,
+// and an uncaught exception crashes with no line saying why it happened. A
+// future unguarded rejection or a throw outside a request handler should exit
+// the same deliberate way the config-validation failures below do -- logged,
+// and exit(1) so Restart=on-failure actually restarts it.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection, exiting:', reason);
+  process.exit(1);
+});
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception, exiting:', error);
+  process.exit(1);
+});
+
 const host = process.env.HOST ?? '127.0.0.1';
 const port = Number(process.env.PORT ?? 4174);
 const hermesOrigin = process.env.HERMES_ORIGIN ?? 'http://127.0.0.1:9119';
@@ -184,6 +199,12 @@ const READ_TIMEOUT_MS = configuredReadTimeout === '' ? 30_000 : Number(configure
 const WRITE_WINDOW_MS = 60_000;
 const writeBudget = new Map();
 
+// Tracked so shutdown can force them closed. A live WebSocket is exactly what
+// server.close()'s callback waits on, and it is long-lived by design -- a
+// chat left open would otherwise hold a restart hostage until systemd's
+// SIGKILL.
+const upgradedSockets = new Set();
+
 function withinWriteBudget(login) {
   // 0 means no writes at all. It used to mean unlimited, which is the opposite
   // of what someone typing it while hardening a deployment would expect.
@@ -209,9 +230,68 @@ function audit(outcome, { login, method, path }) {
   );
 }
 
-function refuseIdentity(response, pathname, verdict) {
-  console.warn(`Refused ${pathname} for ${verdict.login ?? '(no identity)'}: ${verdict.reason}`);
-  securityHeaders(response);
+// Every refusal below this point logs before identity is known (or, for an
+// identity that fails the allowlist, before the caller has proved anything
+// about itself), so an unauthenticated peer that floods requests floods the
+// journal too. Bucket per remote address rather than either drowning the log
+// or letting it grow unbounded: the first REFUSAL_LOG_LIMIT in a window print
+// normally, the rest are counted and folded into one summary line instead.
+// audit() lines are untouched -- those are post-identity and already metered
+// by the write budget.
+const REFUSAL_LOG_LIMIT = 20;
+const REFUSAL_LOG_WINDOW_MS = 60_000;
+const REFUSAL_LOG_FLUSH_MS = 300;
+const REFUSAL_LOG_IDLE_MS = 5 * 60_000;
+const REFUSAL_LOG_MAX_ADDRESSES = 1000;
+const refusalLog = new Map();
+
+function flushRefusalSummary(address, entry) {
+  entry.timer = null;
+  if (entry.suppressed === 0) return;
+  const count = entry.suppressed;
+  entry.suppressed = 0;
+  console.warn(
+    `Suppressed ${count} refusal${count === 1 ? '' : 's'} from ${address} in the last minute`,
+  );
+}
+
+function logRefusal(request, message) {
+  const address = request.socket?.remoteAddress ?? 'unknown';
+  const now = Date.now();
+  let entry = refusalLog.get(address);
+  if (!entry || now >= entry.resetAt) {
+    // The map has no natural upper bound otherwise. Evict what has sat idle a
+    // while before adding, so a spray of source addresses cannot grow it
+    // without limit either.
+    if (refusalLog.size >= REFUSAL_LOG_MAX_ADDRESSES) {
+      for (const [key, value] of refusalLog) {
+        if (now - value.resetAt > REFUSAL_LOG_IDLE_MS) refusalLog.delete(key);
+      }
+    }
+    entry = { count: 0, suppressed: 0, resetAt: now + REFUSAL_LOG_WINDOW_MS, timer: null };
+    refusalLog.set(address, entry);
+  }
+  entry.count += 1;
+  if (entry.count <= REFUSAL_LOG_LIMIT) {
+    console.warn(message);
+    return;
+  }
+  entry.suppressed += 1;
+  // A short debounce, independent of the minute-long throttle window, so the
+  // summary shows up promptly during a burst rather than only once the
+  // window it belongs to finally rolls over.
+  if (!entry.timer) {
+    entry.timer = setTimeout(() => flushRefusalSummary(address, entry), REFUSAL_LOG_FLUSH_MS);
+    entry.timer.unref();
+  }
+}
+
+function refuseIdentity(request, response, pathname, verdict) {
+  logRefusal(
+    request,
+    `Refused ${pathname} for ${verdict.login ?? '(no identity)'}: ${verdict.reason}`,
+  );
+  apiSecurityHeaders(response);
   response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
   // Never name the allowlist here: a refusal must not teach the caller what
   // would have worked.
@@ -344,7 +424,7 @@ function decodeChangesStructure(pathname) {
 // endpoints enumerated as writes below. A GET cannot run them on today's
 // backend -- it answers 405 -- but it reaches upstream unlimited and unaudited,
 // and the prefix would silently cover any future route added underneath it.
-const READ_EXCLUSIONS = /\/(?:pause|resume|trigger)\/?$/i;
+const READ_EXCLUDED_ACTIONS = new Set(['pause', 'resume', 'trigger']);
 
 /** The path as the upstream will read it. Safe to match on, because
  * decodeChangesStructure() has already refused anything whose decode moves a
@@ -357,12 +437,29 @@ function decodedPath(pathname) {
   }
 }
 
+/**
+ * Whether a path's last segment names one of the excluded actions.
+ *
+ * A suffix regex used to stand in for this and missed `trigger//` (an empty
+ * segment `\/?` does not absorb), `trigger;x` (a matrix parameter, outside
+ * its vocabulary) and a decoded `trigger%20` (trailing space) -- each read as
+ * an ordinary, unaudited GET under /api/cron/jobs. Segmenting the path and
+ * normalising the last piece instead closes all three without also matching
+ * `triggered` or `trigger/foo`.
+ */
+function namesExcludedAction(pathname) {
+  const segments = pathname.split('/').filter(Boolean);
+  const last = segments.length ? segments[segments.length - 1] : '';
+  const normalized = last.split(';')[0].trim().toLowerCase();
+  return READ_EXCLUDED_ACTIONS.has(normalized);
+}
+
 function isAllowedRestRequest(method, pathname) {
   if (method === 'GET' || method === 'HEAD') {
     // Against the decoded form too: /api/cron/jobs/x/%74rigger is `trigger` by
     // the time upstream routes it, and the point of the exclusion is that these
     // never travel unlimited and unaudited.
-    if (READ_EXCLUSIONS.test(pathname) || READ_EXCLUSIONS.test(decodedPath(pathname))) {
+    if (namesExcludedAction(pathname) || namesExcludedAction(decodedPath(pathname))) {
       return false;
     }
     return restReadPrefixes.some(
@@ -391,8 +488,22 @@ function isAllowedRestRequest(method, pathname) {
  * the authorization boundary for them and no web page can reach this state.
  * "null" is not missing: it is what a sandboxed iframe or a file:// page
  * sends, and it is refused.
+ *
+ * That reasoning has a gap: a browser omits Origin on a `no-cors` GET
+ * subresource load too -- `<img src>`, `<script src>` -- so "missing Origin"
+ * does not actually mean "not a browser". `Sec-Fetch-Site` is the header that
+ * does: it is set by the browser itself (Fetch Metadata), cannot be forged by
+ * the page, and is present on exactly the requests Origin is silent about.
+ * `cross-site` and `same-site` both mean a page other than this one issued
+ * the request, so they are refused the same as a cross-origin Origin. Its
+ * absence, or `same-origin`/`none`, is not evidence of anything and is left
+ * to the rest of this function -- curl and this test suite send neither
+ * header.
  */
 function isSameOrigin(request, url) {
+  const secFetchSite = String(request.headers['sec-fetch-site'] ?? '').toLowerCase();
+  if (secFetchSite === 'cross-site' || secFetchSite === 'same-site') return false;
+
   const origin = request.headers.origin;
   if (origin === undefined) return true;
   if (!origin || origin === 'null') return false;
@@ -409,14 +520,14 @@ function isSameOrigin(request, url) {
 }
 
 function refuseRequest(response, status, message) {
-  securityHeaders(response);
+  apiSecurityHeaders(response);
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify({ error: message }));
 }
 
-function refuseCrossOrigin(response, pathname) {
-  console.warn(`Refused cross-origin request to ${pathname}`);
-  securityHeaders(response);
+function refuseCrossOrigin(request, response, pathname) {
+  logRefusal(request, `Refused cross-origin request to ${pathname}`);
+  apiSecurityHeaders(response);
   response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify({ error: 'Cross-origin requests are not accepted.' }));
 }
@@ -462,23 +573,56 @@ proxy.on('error', (error, request, target) => {
   target.destroy();
 });
 
+// What the internal hop is allowed to see of the client's request.
+// Forward-allowlisted rather than stripped by name: http-proxy copies every
+// header the client sent onto the outgoing request before proxyReq/proxyReqWs
+// fire, so a blocklist has to name each spoofable one -- X-Forwarded-*,
+// X-Real-IP, X-Original-URL, Tailscale-User-Name, Cookie, Authorization -- and
+// stays correct only for as long as nobody forgets one. This proxy uses none
+// of Cookie or Authorization itself, so neither belongs upstream either. A
+// forward-allowlist has the opposite failure mode: a header this file has
+// never heard of does not reach Hermes by default.
+const FORWARDED_REQUEST_HEADERS = new Set([
+  'host', // already rewritten to the loopback target by changeOrigin
+  'content-type',
+  'content-length',
+  'transfer-encoding',
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'user-agent',
+  'origin',
+  'connection',
+  'upgrade',
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-extensions',
+  'sec-websocket-protocol',
+  'cache-control',
+  'pragma',
+  'if-none-match',
+  'if-modified-since',
+  'range',
+]);
+
+function stripUnlistedHeaders(proxyRequest) {
+  for (const name of proxyRequest.getHeaderNames()) {
+    if (!FORWARDED_REQUEST_HEADERS.has(name)) proxyRequest.removeHeader(name);
+  }
+}
+
 // Hermes authenticates REST calls with a header, the same shared loopback
 // credential the WebSocket upgrade uses. Add it on the internal hop only, so
 // the browser never receives it -- mirroring what proxyReqWs already does.
 proxy.on('proxyReq', (proxyRequest) => {
+  stripUnlistedHeaders(proxyRequest);
   // Unconditionally, so that a client-supplied copy cannot survive when no
-  // token is configured for us to overwrite it with.
+  // token is configured for us to overwrite it with. (The allowlist above
+  // already dropped it, since it is not on it -- this is belt-and-braces.)
   proxyRequest.removeHeader('x-hermes-session-token');
   if (hermesSessionToken) {
     proxyRequest.setHeader('X-Hermes-Session-Token', hermesSessionToken);
   }
-  // The identity has done its work at this boundary; Hermes has no use for it
-  // and should not learn to trust a header this proxy merely relayed.
-  proxyRequest.removeHeader('tailscale-user-login');
-  proxyRequest.removeHeader('x-forwarded-for');
-  proxyRequest.removeHeader('x-forwarded-host');
-  proxyRequest.removeHeader('x-forwarded-proto');
-  proxyRequest.removeHeader('x-forwarded-port');
 });
 
 // Rewriting Origin to the loopback value satisfies Hermes's own DNS-rebinding
@@ -487,13 +631,18 @@ proxy.on('proxyReq', (proxyRequest) => {
 // isSameOrigin() and the upgrade handler; this rewrite is safe only because
 // of them.
 proxy.on('proxyReqWs', (proxyRequest) => {
+  stripUnlistedHeaders(proxyRequest);
   proxyRequest.setHeader('origin', hermesOrigin);
   proxyRequest.removeHeader('x-hermes-session-token');
-  proxyRequest.removeHeader('tailscale-user-login');
-  proxyRequest.removeHeader('x-forwarded-for');
-  proxyRequest.removeHeader('x-forwarded-host');
-  proxyRequest.removeHeader('x-forwarded-proto');
-  proxyRequest.removeHeader('x-forwarded-port');
+});
+
+// proxy.web() only ever runs for /api/*, so this is scoped by construction.
+// Setting Cache-Control on `response` before calling proxy.web() is not
+// enough on its own: http-proxy copies every header off the upstream
+// response onto ours, so a Hermes route that sends its own Cache-Control
+// would overwrite it. Mutating proxyRes.headers here runs before that copy.
+proxy.on('proxyRes', (proxyRes) => {
+  proxyRes.headers['cache-control'] = 'no-store';
 });
 
 function securityHeaders(response) {
@@ -508,6 +657,20 @@ function securityHeaders(response) {
     // future XSS an unrestricted exfiltration channel.
     "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
   );
+}
+
+/**
+ * securityHeaders() plus Cache-Control: no-store, for every response under
+ * /api/* and /push/* -- proxied or answered here directly, success or
+ * refusal. Authenticated agent state (a transcript, a session list) has no
+ * business surviving in the phone's HTTP cache: it would still be readable
+ * there after the login that fetched it left the allowlist. Static assets are
+ * deliberately exempt; they keep the `public, max-age` set where they are
+ * served.
+ */
+function apiSecurityHeaders(response) {
+  securityHeaders(response);
+  response.setHeader('Cache-Control', 'no-store');
 }
 
 function publicPath(urlPath) {
@@ -542,6 +705,7 @@ const notifications = createNotifications({ hermesOrigin, sessionToken: hermesSe
 const server = http.createServer((request, response) => {
   const url = parseRequestUrl(request);
   if (!url) {
+    securityHeaders(response);
     response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Bad request');
     return;
@@ -558,23 +722,34 @@ const server = http.createServer((request, response) => {
       refuseRequest(response, 400, 'Bad request.');
       return;
     }
+    // isOriginForm refuses a *leading* //, which is a smuggled authority. An
+    // interior or trailing // is a different problem: no route this proxy
+    // knows has an empty path segment, so the only thing one does is change
+    // where "the last segment" is -- which is exactly what let
+    // /api/cron/jobs/x/trigger// read as a plain read instead of the
+    // metered, audited action it decodes to.
+    if (url.pathname.includes('//')) {
+      logRefusal(request, `Refused ${url.pathname}: empty path segment`);
+      refuseRequest(response, 400, 'Bad request.');
+      return;
+    }
     // Judge the Host header, not url.host. They are the same once the target is
     // origin-form, and checking the header directly means no future change to
     // URL parsing can quietly move which value this decision rests on.
     // Before same-origin, because same-origin only establishes that Origin and
     // Host agree, and rebinding makes them agree on a name the attacker owns.
     if (!isAllowedHost(request.headers.host) || !isAllowedHost(url.host)) {
-      console.warn(`Refused ${url.pathname} for host ${request.headers.host}`);
+      logRefusal(request, `Refused ${url.pathname} for host ${request.headers.host}`);
       refuseRequest(response, 421, 'This host is not served here.');
       return;
     }
     if (ENCODED_SEPARATOR.test(url.pathname) || decodeChangesStructure(url.pathname)) {
-      console.warn(`Refused ${url.pathname}: encoded path separator`);
+      logRefusal(request, `Refused ${url.pathname}: encoded path separator`);
       refuseRequest(response, 400, 'Bad request.');
       return;
     }
     if (!isSameOrigin(request, url)) {
-      refuseCrossOrigin(response, url.pathname);
+      refuseCrossOrigin(request, response, url.pathname);
       return;
     }
     // Identity comes after same-origin so a hostile page is refused as such,
@@ -583,7 +758,7 @@ const server = http.createServer((request, response) => {
     // order to explain an authorization problem, and it carries no agent data.
     const verdict = identify(request);
     if (!verdict.ok) {
-      refuseIdentity(response, url.pathname, verdict);
+      refuseIdentity(request, response, url.pathname, verdict);
       return;
     }
   }
@@ -598,7 +773,7 @@ const server = http.createServer((request, response) => {
       const entry = { login, method: request.method, path: url.pathname };
       if (!withinWriteBudget(login)) {
         audit('rate-limited', entry);
-        securityHeaders(response);
+        apiSecurityHeaders(response);
         response.writeHead(429, {
           'content-type': 'application/json; charset=utf-8',
           'retry-after': '60',
@@ -608,7 +783,7 @@ const server = http.createServer((request, response) => {
       }
       audit('write', entry);
     }
-    securityHeaders(response);
+    apiSecurityHeaders(response);
     notifications.handleRequest(request, response, url).catch((error) => {
       console.error('Push request failed:', error.message);
       if (!response.headersSent) {
@@ -631,7 +806,7 @@ const server = http.createServer((request, response) => {
   }
   if (url.pathname.startsWith('/api/')) {
     if (url.pathname === websocketPath || !isAllowedRestRequest(request.method, url.pathname)) {
-      securityHeaders(response);
+      apiSecurityHeaders(response);
       response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ error: 'Not exposed by hermes-mobile.' }));
       return;
@@ -642,7 +817,7 @@ const server = http.createServer((request, response) => {
       const entry = { login, method: request.method, path: url.pathname };
       if (!withinWriteBudget(login)) {
         audit('rate-limited', entry);
-        securityHeaders(response);
+        apiSecurityHeaders(response);
         response.writeHead(429, {
           'content-type': 'application/json; charset=utf-8',
           'retry-after': '60',
@@ -652,7 +827,7 @@ const server = http.createServer((request, response) => {
       }
       audit('write', entry);
     }
-    securityHeaders(response);
+    apiSecurityHeaders(response);
     // Send the string that was authorized above, not the one that arrived.
     // http-proxy already derives the same value, so this is belt-and-braces --
     // but it makes "authorized path == forwarded path" a property of this file
@@ -665,6 +840,7 @@ const server = http.createServer((request, response) => {
 
   const decoded = decodePath(url.pathname);
   if (decoded === null) {
+    securityHeaders(response);
     response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Bad request');
     return;
@@ -681,6 +857,7 @@ const server = http.createServer((request, response) => {
     stats = null;
   }
   if (!stats || !stats.isFile()) {
+    securityHeaders(response);
     response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     response.end('Not found');
     return;
@@ -713,14 +890,24 @@ server.on('upgrade', (request, socket, head) => {
   // allowlist with the session token attached. Check the shape first, then the
   // Host header itself.
   if (!isOriginForm(request.url) || !url) {
-    console.warn('Refused WebSocket upgrade: request target is not origin-form');
+    logRefusal(request, 'Refused WebSocket upgrade: request target is not origin-form');
     socket.destroy();
     return;
   }
   // Same reasoning as the request gate: same-origin only proves Origin and Host
   // agree, and rebinding arranges that. Vouch for the Host first.
   if (!isAllowedHost(request.headers.host) || !isAllowedHost(url.host)) {
-    console.warn(`Refused WebSocket upgrade for host ${request.headers.host}`);
+    logRefusal(request, `Refused WebSocket upgrade for host ${request.headers.host}`);
+    socket.destroy();
+    return;
+  }
+  // Same reasoning as the request gate: the check just below is a literal
+  // string match against websocketPath, which today makes this inert -- an
+  // encoded separator changes the string and so is refused there anyway. It
+  // is here so the two gates stay line-for-line parallel rather than relying
+  // on that match staying exact forever.
+  if (ENCODED_SEPARATOR.test(url.pathname) || decodeChangesStructure(url.pathname)) {
+    logRefusal(request, `Refused WebSocket upgrade for ${url.pathname}: encoded path separator`);
     socket.destroy();
     return;
   }
@@ -728,7 +915,7 @@ server.on('upgrade', (request, socket, head) => {
   // between a hostile page and an authenticated JSON-RPC session. It has to
   // come before the token is attached, not after.
   if (!isSameOrigin(request, url)) {
-    console.warn(`Refused cross-origin WebSocket upgrade from ${request.headers.origin}`);
+    logRefusal(request, `Refused cross-origin WebSocket upgrade from ${request.headers.origin}`);
     socket.destroy();
     return;
   }
@@ -737,7 +924,10 @@ server.on('upgrade', (request, socket, head) => {
   // who can reach the port.
   const who = identify(request);
   if (!who.ok) {
-    console.warn(`Refused WebSocket upgrade for ${who.login ?? '(no identity)'}: ${who.reason}`);
+    logRefusal(
+      request,
+      `Refused WebSocket upgrade for ${who.login ?? '(no identity)'}: ${who.reason}`,
+    );
     socket.destroy();
     return;
   }
@@ -753,8 +943,23 @@ server.on('upgrade', (request, socket, head) => {
     socket.destroy();
     return;
   }
+  // The socket is the highest-privilege event this proxy admits -- its
+  // JSON-RPC method surface includes shell.exec -- and until now it was the
+  // one path that reached the agent with no audit line and no write budget.
+  // Meter and log it exactly like a REST write, before proxy.ws hands the
+  // connection off.
+  const entry = { login: who.login, method: 'GET', path: url.pathname };
+  if (!withinWriteBudget(who.login)) {
+    audit('rate-limited', entry);
+    console.warn(`Refused WebSocket upgrade for ${who.login}: write budget exhausted`);
+    socket.destroy();
+    return;
+  }
+  audit('upgrade', entry);
   url.searchParams.set('token', hermesSessionToken);
   request.url = `${url.pathname}${url.search}`;
+  upgradedSockets.add(socket);
+  socket.on('close', () => upgradedSockets.delete(socket));
   proxy.ws(request, socket, head);
 });
 
@@ -857,7 +1062,16 @@ server.listen(port, host, () => {
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
+    // server.close()'s callback waits for every live connection to end on its
+    // own -- a keep-alive HTTP socket idling between polls, or a WebSocket
+    // that is long-lived by design -- so a `systemctl restart` with a chat
+    // open used to hang until systemd's SIGKILL, 90s away by default. Force
+    // everything closed instead of waiting, with a hard fallback in case some
+    // handle this file does not know about keeps the process alive anyway.
     notifications.stop();
     server.close(() => process.exit(0));
+    server.closeAllConnections?.(); // Node >=18.2
+    for (const socket of upgradedSockets) socket.destroy();
+    setTimeout(() => process.exit(0), 5000).unref();
   });
 }

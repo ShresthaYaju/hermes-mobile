@@ -9,6 +9,9 @@
 
 [Unit]
 Description=Hermes Mobile PWA proxy
+# Ordered after the backend, but deliberately not `Wants=` on it: the proxy is
+# designed to start and answer 502 while the backend is down or restarting,
+# not to fail to start alongside it.
 After=network-online.target hermes-mobile-backend.service
 Wants=network-online.target
 
@@ -27,6 +30,10 @@ Environment=HERMES_ORIGIN=http://127.0.0.1:9119
 ExecStart=%h/.local/bin/node %h/hermes-mobile/server.mjs
 Restart=on-failure
 RestartSec=3
+# The process's own SIGTERM handler force-closes every connection and exits
+# well inside this; it exists as a backstop so a restart cannot still end up
+# waiting out the default 90s TimeoutStopSec before systemd sends SIGKILL.
+TimeoutStopSec=10
 
 # This process terminates a network path from the tailnet, so give it as little
 # of the machine as it can run with. It only ever needs to read its own
@@ -37,6 +44,9 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
+# Tied to HERMES_MOBILE_STATE_DIR in the env file: override one without the
+# other and push-state writes fail silently under this sandbox even though
+# they work fine from a shell.
 ReadWritePaths=%h/.local/state/hermes-mobile
 ProtectKernelTunables=true
 ProtectKernelModules=true
