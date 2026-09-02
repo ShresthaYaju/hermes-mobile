@@ -101,9 +101,14 @@ you can show one is worse than described, that very much is.
   host's browser visited could reach the RPC socket. The `Host` allowlist is
   what closed that, so treat a rebinding bypass as critical rather than
   theoretical.
-- **A missing `Origin` header is allowed.** A missing `Origin` means the caller
-  is not a browser, and non-browser callers are stopped by the identity gate
-  instead. `Origin: null` *is* refused.
+- **A missing `Origin` header is allowed, unless `Sec-Fetch-Site` says
+  otherwise.** A `no-cors` subresource load (`<img src>`, `<script src>`)
+  never carries `Origin` either, but it does carry `Sec-Fetch-Site:
+  cross-site` or `same-site` — a browser-set header a page cannot forge or
+  suppress — and the proxy refuses that exactly like a cross-origin `Origin`.
+  With neither header present, the caller is not a browser at all, and
+  non-browser callers are stopped by the identity gate instead. `Origin: null`
+  *is* refused.
 - **Deploying it wrong.** Binding a public address, running it behind
   `tailscale funnel`, or setting `HERMES_MOBILE_ALLOW_PUBLIC_BIND=1` publishes
   remote code execution to the internet. The server refuses the first two by
@@ -125,6 +130,7 @@ Stated plainly, because the value of each one is easy to overestimate:
 | REST allowlist | Withheld Hermes routes over HTTP | The WebSocket, which is the path that matters |
 | Write rate limit + audit log | A script looping on an agent-triggering write | A patient attacker |
 | Strict CSP | Exfiltration after a hypothetical XSS | The XSS itself |
+| Push endpoint checks (literal host at subscribe, resolved address at every send) | A subscription aimed at the tailnet or the host itself — including one repointed there by DNS after being accepted | A push service that is itself compromised |
 
 One more thing that is not in the table: the identity header is *trusted*, not
 verified. Nothing cryptographically binds it to a tailnet user. What makes it
@@ -132,6 +138,26 @@ worth anything is that `tailscale serve` injects it and strips client-supplied
 copies, and that this proxy refuses it off a non-loopback socket. Put a
 different reverse proxy in front and you inherit the job of stripping it — on
 the same host, because otherwise the proxy will not believe it at all.
+
+A WebSocket upgrade is metered and recorded exactly like a REST write: it
+spends the same per-identity budget and is written to the audit log with
+outcome `upgrade` rather than `write`. Its method surface is a superset of any
+REST write's, so it would be the one gap in "writes are rate limited and
+recorded" otherwise.
+
+Push endpoints get two separate checks, not one, because checking only the
+literal host a caller supplied is not enough: that host is what a resolver
+turns into a connection at *send* time, on every failing cron tick, for as
+long as the subscription is kept. A name can resolve publicly when accepted
+and be repointed into the tailnet afterward, or resolve to several addresses
+where only one of them is internal. So `/push/subscribe` refuses an obviously
+internal literal (an IP in a private/tailnet range, a dotless name, a `.local`
+or `.ts.net` name, and the like — see `isDeliverableEndpoint` in
+`notifications.mjs`), and separately, every delivery resolves the endpoint's
+host itself and refuses to connect if any address it comes back with is
+internal (`guardedLookup`). The first is free and rejects at the door; the
+second is what still holds if a name is deliberately rebound after being
+accepted.
 
 Two things follow from that table. First, the same-origin check is a *browser*
 control and nothing more — before the identity gate existed, reachability was
