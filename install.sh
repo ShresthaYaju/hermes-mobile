@@ -70,12 +70,23 @@ done
 # --- output -----------------------------------------------------------------
 
 if [ -t 1 ]; then
+  COLOR=1
   BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RESET=$'\e[0m'
 else
+  COLOR=''
   BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; RESET=''
 fi
 
 step() { printf '\n%s==> %s%s\n' "$BOLD" "$*" "$RESET"; }
+# OSC 8 makes a URL clickable in terminals that understand it; the others
+# show the plain text, as does anything that is not a terminal.
+link() {
+  if [ -n "$COLOR" ]; then
+    printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$1" "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
 ok()   { printf '%s  ✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
 warn() { printf '%s  ! %s%s\n' "$YELLOW" "$*" "$RESET" >&2; }
 fail() { printf '%s  ✗ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
@@ -329,11 +340,18 @@ fi
 
 printf '\n%sDone.%s\n\n' "$BOLD" "$RESET"
 if [ -n "$TS_DNS" ]; then
-  printf 'Open %shttps://%s%s on your phone (it must be on the same tailnet),\n' "$BOLD" "$TS_DNS" "$RESET"
+  URL="https://$TS_DNS"
+  printf 'Open this on your phone, or point its camera at the code below:\n\n'
+  printf '  %s%s%s\n\n' "$BOLD" "$(link "$URL")" "$RESET"
+  "$NODE" "$DIR/qr.mjs" ${COLOR:+--color} --indent 2 "$URL" \
+    || warn 'Could not draw the QR code; type the URL instead.'
+  printf '\n'
 else
-  printf 'Open the URL shown by `tailscale serve status` on your phone,\n'
+  printf 'Open the URL shown by `tailscale serve status` on your phone.\n\n'
 fi
-printf 'then Share → Add to Home Screen (iOS) or Install app (Android).\n'
+printf 'The phone must be on the same tailnet. Once the page is open:\n'
+printf '  iOS      Share → Add to Home Screen\n'
+printf '  Android  Install app\n'
 printf 'Push notifications are offered under Config once it is on the home screen.\n\n'
 printf '%sUseful later:%s\n' "$DIM" "$RESET"
 printf '  systemctl --user status %s %s\n' "$BACKEND_UNIT" "$PROXY_UNIT"

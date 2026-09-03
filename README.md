@@ -71,7 +71,7 @@ It checks for Node 22+, Hermes and Tailscale, clones to `~/hermes-mobile`, write
 service env file, installs and starts the two user systemd units, and runs
 `tailscale serve`. It never uses `sudo`: the one step that sometimes needs it
 (`tailscale serve`, the first time) is printed for you to run instead. Then it prints
-the `https://` URL to open on your phone.
+the `https://` URL to open on your phone, and a QR code of it to scan instead of typing.
 
 This is a control surface for an agent with shell access, so read the script before
 piping it to a shell — it is 300 lines of plain bash, and reading it *is* the
