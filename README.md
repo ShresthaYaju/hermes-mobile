@@ -31,7 +31,7 @@ Tapping one of your own chats reopens it in the composer, with its history above
 
 ## Requirements
 
-- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**, installed and running as `hermes serve` on loopback. This app is a proxy in front of it and has no function without it. There is no demo or mock mode.
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**, installed and running as `hermes serve` on loopback. This app is a proxy in front of it and has no function without it. (`npm run demo` runs it against invented data, for screenshots only.)
 - **[Tailscale](https://tailscale.com/)**, with `tailscale serve` available. Tailscale is what authenticates callers; this app has no login of its own.
 - **Node.js 22 or newer.** The test script relies on `node --test` expanding a glob itself.
 - Linux with user systemd, if you want the supplied service units. Nothing else depends on systemd.
@@ -270,6 +270,24 @@ HOST=127.0.0.1 PORT=4174 HERMES_ORIGIN=http://127.0.0.1:9119 \
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) — particularly the two design rules that are not obvious from the code, and the tests that exist to catch failures every other test sails past.
+
+### Screenshots with made-up data
+
+`npm run demo` starts a stand-in backend full of invented threads, scheduled jobs,
+profiles and transcripts, with the real proxy in front of it, so the app can be
+photographed without showing anything from your actual setup. Nothing is written
+anywhere and push stays off. Chat works: a prompt that mentions deploying or
+restarting raises an approval card, a "which … ?" question raises a clarify prompt,
+and anything else streams a scripted reply.
+
+```bash
+systemctl --user stop hermes-mobile-pwa.service   # it holds port 4174
+npm run demo                                       # phone reaches this instead
+systemctl --user start hermes-mobile-pwa.service  # afterwards
+```
+
+Add `--local` to also open it in this machine's browser at `http://127.0.0.1:4174/`,
+or `--port N` to leave the service running and use another port.
 
 ## License
 
