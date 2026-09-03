@@ -39,9 +39,20 @@ TimeoutStopSec=10
 # of the machine as it can run with. It only ever needs to read its own
 # directory, write the push-subscription file under ~/.local/state, and open
 # TCP sockets on loopback.
+#
+# PrivateDevices=, ProtectClock= and ProtectKernelModules= are deliberately
+# absent. Each one implies a CapabilityBoundingSet= drop, and dropping bounding
+# set capabilities needs CAP_SETPCAP, which a `--user` manager does not have.
+# systemd fails the unit at step CAPABILITIES with 218/CAPABILITIES before node
+# ever runs, and an explicit CapabilityBoundingSet= cannot buy them back: the
+# implication is applied after the whole unit is parsed, so it always wins.
+# Little is actually lost. The process starts with an empty capability set and
+# NoNewPrivileges=true means it can never gain one, so the bounding set is moot
+# either way, and @system-service below already denies @module, @clock and
+# @raw-io. Only PrivateDevices='s private /dev genuinely goes. If you ever move
+# this to a system unit with User=, add all three back.
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 # Tied to HERMES_MOBILE_STATE_DIR in the env file: override one without the
@@ -49,9 +60,7 @@ ProtectHome=read-only
 # they work fine from a shell.
 ReadWritePaths=%h/.local/state/hermes-mobile
 ProtectKernelTunables=true
-ProtectKernelModules=true
 ProtectControlGroups=true
-ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6
