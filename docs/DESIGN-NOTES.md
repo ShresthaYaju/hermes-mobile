@@ -178,9 +178,15 @@ simply *ask the agent* to run a command. Allowlisting RPC methods closes the dir
 With the identity gate in place the residual threat is narrow: an XSS in this app reaching RPC
 without going through the agent. There is a strict CSP (`default-src 'self'; connect-src
 'self'`), every markup path escapes, and the one HTML-accepting prop is fed only by a renderer
-that escapes first — so the app renders no untrusted HTML. That residue does not justify
-hand-rolled WebSocket frame parsing sitting in the path of the live chat, where a parsing bug
-breaks the feature the app exists for.
+that escapes first — so the app renders no untrusted HTML. That residue does not justify a
+method allowlist sitting in the path of the live chat, where a mistake breaks the feature the
+app exists for.
+
+The proxy does now parse every JSON-RPC frame — `gateway.mjs` has to, to rewrite request ids
+and to see the events it turns into notifications — so the *cost* of an allowlist has dropped.
+The reasoning above has not: the allowlist would still close the direct path and not the real
+one. What the multiplexer does refuse is anything that is not a JSON object, because an
+unparseable frame cannot be routed.
 
 Revisit condition, stated so it is not forgotten: **if this app ever renders untrusted HTML,
 build the method allowlist.**

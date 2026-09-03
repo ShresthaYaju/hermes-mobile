@@ -1,10 +1,17 @@
-// Web Push: subscription storage plus a watcher that notifies when a scheduled
-// job fails.
+// Web Push: subscription storage plus three sources of things a phone-only
+// user needs to be told about. observe() turns a Hermes session event
+// (someone else's proxy connection, forwarded by the gateway) into a push --
+// an approval or question stuck waiting, a reply or error once the phone has
+// stopped looking. poll() watches scheduled cron jobs the same way it always
+// has. And poll() separately watches its own connection to Hermes, because a
+// proxy that has quietly lost its agent is not something the phone would
+// otherwise ever find out.
 //
 // This exists because the failure mode that actually matters for an always-on
-// agent is silent: a cron job whose delivery target is "local" writes its error
-// to a file on the host and tells nobody. The phone is the only place the
-// person ever looks, so the phone has to be told.
+// agent is silent: nothing surfaces on its own unless the phone happens to be
+// looking at it right now, and the phone is the only place the person ever
+// looks. Each device picks which of these it wants -- see PUSH_KINDS -- so a
+// push is only ever as loud as that device asked for.
 //
 // Everything here degrades to a no-op when VAPID keys are absent. The app must
 // stay fully usable without push configured.
@@ -16,6 +23,10 @@ import process from 'node:process';
 import dns from 'node:dns';
 import https from 'node:https';
 import webpush from 'web-push';
+
+// The exact spelling and order the client shows as labels, and the order
+// every stored `kinds` list is normalized into.
+export const PUSH_KINDS = ['approval', 'reply', 'error', 'ops', 'job'];
 
 const POLL_MS = 60_000;
 const MAX_SUBSCRIPTIONS = 20;
@@ -51,6 +62,10 @@ const MAX_PUSH_PAYLOAD_BYTES = 3800;
 // wedged connection to one dead-but-not-yet-reset endpoint can hold the watcher
 // open indefinitely -- there is no default timeout on an outbound HTTPS request.
 const DELIVERY_TIMEOUT_MS = 10_000;
+// Consecutive failed polls (~3 minutes at the 60s tick) before the backend is
+// treated as down rather than blipping -- a deploy or a restart of the agent
+// must not itself trigger an unreachable alert.
+const BACKEND_DOWN_THRESHOLD = 3;
 
 const defaultStateDir = () =>
   process.env.HERMES_MOBILE_STATE_DIR ||
@@ -366,6 +381,18 @@ function keysAreUsable(keys) {
   return { ok: true };
 }
 
+/** Reduces an arbitrary `kinds` field to the subset of PUSH_KINDS it names,
+ * de-duplicated and in PUSH_KINDS order. Returns null when `value` is not an
+ * array at all -- the signal that kinds was not supplied, as distinct from an
+ * array that was supplied and happens to name nothing recognised (or nothing
+ * at all), which is a real, explicit "subscribed to nothing" and comes back
+ * as []. Callers decide what null means; this only classifies the input. */
+function sanitizeKinds(value) {
+  if (!Array.isArray(value)) return null;
+  const requested = new Set(value);
+  return PUSH_KINDS.filter((kind) => requested.has(kind));
+}
+
 /**
  * Rebuilds a subscription from an arbitrary object field-by-field, dropping
  * anything that is not one of the fields this code itself writes, and
@@ -380,10 +407,14 @@ function normalizeSubscription(candidate) {
   if (!endpoint.ok) return null;
   const keys = keysAreUsable(candidate?.keys);
   if (!keys.ok) return null;
+  // A legacy entry -- from before kinds existed -- carries no signal that
+  // anything was ever opted out of, so it comes back as every kind rather
+  // than none.
   const rebuilt = {
     endpoint: candidate.endpoint,
     keys: { p256dh: candidate.keys.p256dh, auth: candidate.keys.auth },
     owner: typeof candidate.owner === 'string' ? candidate.owner : null,
+    kinds: sanitizeKinds(candidate?.kinds) ?? [...PUSH_KINDS],
   };
   if (Number.isInteger(candidate?.failures) && candidate.failures > 0) {
     rebuilt.failures = candidate.failures;
@@ -471,6 +502,12 @@ export function createNotifications({
   // otherwise called unconditionally from addSubscription/removeSubscription,
   // which already know they have something worth persisting.
   let dirty = false;
+  // Backend reachability is a live-process concern, not a durable one -- it
+  // resets to "assume reachable" on every restart rather than surviving in
+  // the state file, so a proxy that comes back up after a crash does not
+  // immediately replay a stale "still down" verdict.
+  let consecutiveFetchFailures = 0;
+  let backendDown = false;
 
   if (enabled) {
     try {
@@ -633,11 +670,21 @@ export function createNotifications({
       return { ok: false, reason: 'this host is not accepting more push subscriptions' };
     }
 
+    // A caller that omits `kinds` is either the client self-healing (it
+    // re-POSTs the existing subscription every time the notifications setting
+    // is opened) or an older client that never knew kinds existed -- neither
+    // should silently reset a choice already made. Only an explicit array,
+    // even an empty one, changes it; otherwise a known endpoint keeps what it
+    // had, and a genuinely new one defaults to everything.
+    const requestedKinds = sanitizeKinds(subscription?.kinds);
+    const kinds = requestedKinds ?? existing?.kinds ?? [...PUSH_KINDS];
+
     state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== subscription.endpoint);
     state.subscriptions.push({
       endpoint: subscription.endpoint,
       keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth },
       owner,
+      kinds,
     });
     // Bound per identity first, so a device that reinstalls repeatedly -- or a
     // caller doing it on purpose -- evicts only its own older registrations
@@ -674,8 +721,21 @@ export function createNotifications({
     return { ok: true };
   }
 
-  async function send(payload) {
+  /**
+   * `kind` restricts delivery to subscriptions that opted into that
+   * PUSH_KINDS value; `owner`, when a string, further restricts it to that
+   * identity's own devices (approvals, replies and errors belong to whoever's
+   * session produced them -- a job failure or a backend outage, with owner
+   * left null, is host-wide and every kind-matching device gets it).
+   */
+  async function send(payload, { kind, owner = null } = {}) {
     if (!enabled || !state.subscriptions.length) return;
+    const targets = state.subscriptions.filter((subscription) => {
+      if (kind && !subscription.kinds?.includes(kind)) return false;
+      if (typeof owner === 'string' && subscription.owner !== owner) return false;
+      return true;
+    });
+    if (!targets.length) return;
     let body = JSON.stringify(payload);
     if (Buffer.byteLength(body) > MAX_PUSH_PAYLOAD_BYTES) {
       // A payload this size will not fit through most push services anyway
@@ -698,7 +758,7 @@ export function createNotifications({
     const dead = new Set();
     const outcomes = [];
     await Promise.all(
-      state.subscriptions.map(async (subscription) => {
+      targets.map(async (subscription) => {
         try {
           await deliver(subscription, body);
           subscription.failures = 0;
@@ -757,6 +817,99 @@ export function createNotifications({
     }
   }
 
+  // event type       | attached? | kind     | notes
+  // -----------------+-----------+----------+----------------------------------
+  // approval.request  | (any)     | approval | always -- a stuck half-open
+  //                   |           |          | socket must not silence the one
+  //                   |           |          | push that unblocks the agent
+  // clarify.request   | (any)     | approval | same reasoning as above
+  // message.complete  | attached  | (none)   | phone is already looking
+  //   status=interrupted| (any)   | (none)   | not a result worth surfacing
+  //   status=error     | not att. | error    |
+  //   otherwise        | not att. | reply    |
+  // error              | attached | (none)   | phone is already looking
+  //                    | not att. | error    |
+  // anything else      | --        | --       | ignored
+  //
+  // Every push here carries owner: login -- only the person whose session
+  // produced the event, unlike the host-wide job/ops pushes below.
+  async function observe({ login, attached, type, sessionId, threadId, payload } = {}) {
+    try {
+      const p = payload ?? {};
+      const chatUrl = threadId ? `/#/chat/${encodeURIComponent(threadId)}` : '/#/chat';
+
+      if (type === 'approval.request') {
+        await send(
+          {
+            title: 'Approval needed',
+            body: shorten(
+              p.command || p.description || p.tool || 'Hermes is waiting for a decision',
+            ),
+            tag: `approval-${shorten(p.request_id, 60)}`,
+            url: '/#/now',
+          },
+          { kind: 'approval', owner: login },
+        );
+        return;
+      }
+
+      if (type === 'clarify.request') {
+        await send(
+          {
+            title: 'Hermes has a question',
+            body: shorten(p.question || p.text || ''),
+            tag: `approval-${shorten(p.request_id, 60)}`,
+            url: '/#/now',
+          },
+          { kind: 'approval', owner: login },
+        );
+        return;
+      }
+
+      if (type === 'message.complete') {
+        if (attached) return;
+        if (p.status === 'interrupted') return;
+        if (p.status === 'error') {
+          await send(
+            {
+              title: 'Hermes hit an error',
+              body: shorten(p.text),
+              tag: `error-${sessionId}`,
+              url: chatUrl,
+            },
+            { kind: 'error', owner: login },
+          );
+          return;
+        }
+        await send(
+          {
+            title: 'Hermes replied',
+            body: shorten(p.text) || 'Done',
+            tag: `reply-${sessionId}`,
+            url: chatUrl,
+          },
+          { kind: 'reply', owner: login },
+        );
+        return;
+      }
+
+      if (type === 'error') {
+        if (attached) return;
+        await send(
+          {
+            title: 'Hermes hit an error',
+            body: shorten(p.message),
+            tag: `error-${sessionId}`,
+            url: chatUrl,
+          },
+          { kind: 'error', owner: login },
+        );
+      }
+    } catch (error) {
+      console.error('observe() failed:', error.message);
+    }
+  }
+
   async function fetchJobs() {
     const response = await fetch(`${hermesOrigin}/api/cron/jobs?profile=all`, {
       headers: sessionToken ? { 'X-Hermes-Session-Token': sessionToken } : {},
@@ -781,7 +934,33 @@ export function createNotifications({
       } catch (error) {
         // A backend restart must not kill the watcher; just try again next tick.
         console.error('Cron watch poll failed:', error.message);
+        consecutiveFetchFailures += 1;
+        if (!backendDown && consecutiveFetchFailures >= BACKEND_DOWN_THRESHOLD) {
+          backendDown = true;
+          await send(
+            {
+              title: 'Hermes is unreachable',
+              body: 'The proxy cannot reach the agent. Check hermes-mobile-backend.service.',
+              tag: 'ops-backend',
+              url: '/#/config',
+            },
+            { kind: 'ops' },
+          );
+        }
         return;
+      }
+      consecutiveFetchFailures = 0;
+      if (backendDown) {
+        backendDown = false;
+        await send(
+          {
+            title: 'Hermes is back',
+            body: 'The proxy can reach the agent again.',
+            tag: 'ops-backend',
+            url: '/#/config',
+          },
+          { kind: 'ops' },
+        );
       }
 
       // The very first poll only records what it sees. Without this, enabling
@@ -820,20 +999,26 @@ export function createNotifications({
       if (failures.length === 1) {
         const [{ job, status }] = failures;
         const name = shorten(job.name || job.id, NOTIFICATION_TITLE_CHARS);
-        await send({
-          title: `${name} failed`,
-          body: shorten(status.label),
-          tag: shorten(`job-${job.id}`, NOTIFICATION_TAG_CHARS),
-          url: `/#/job/${encodeURIComponent(job.id)}`,
-        });
+        await send(
+          {
+            title: `${name} failed`,
+            body: shorten(status.label),
+            tag: shorten(`job-${job.id}`, NOTIFICATION_TAG_CHARS),
+            url: `/#/job/${encodeURIComponent(job.id)}`,
+          },
+          { kind: 'job' },
+        );
         return;
       }
-      await send({
-        title: `${failures.length} scheduled jobs failed`,
-        body: shorten(failures.map(({ job }) => job.name || job.id).join(', ')),
-        tag: 'jobs',
-        url: '/#/work',
-      });
+      await send(
+        {
+          title: `${failures.length} scheduled jobs failed`,
+          body: shorten(failures.map(({ job }) => job.name || job.id).join(', ')),
+          tag: 'jobs',
+          url: '/#/work',
+        },
+        { kind: 'job' },
+      );
     } finally {
       polling = false;
     }
@@ -861,7 +1046,11 @@ export function createNotifications({
     if (!url.pathname.startsWith('/push/')) return false;
 
     if (url.pathname === '/push/config' && request.method === 'GET') {
-      return json(response, 200, { enabled, publicKey: enabled ? publicKey : null });
+      return json(response, 200, {
+        enabled,
+        publicKey: enabled ? publicKey : null,
+        kinds: PUSH_KINDS,
+      });
     }
     if (!enabled) {
       return json(response, 503, { error: 'Push is not configured on this host.' });
@@ -896,7 +1085,16 @@ export function createNotifications({
     return json(response, 404, { error: 'Not found.' });
   }
 
-  return { enabled, start, stop, handleRequest, poll, addSubscription, removeSubscription };
+  return {
+    enabled,
+    start,
+    stop,
+    handleRequest,
+    poll,
+    addSubscription,
+    removeSubscription,
+    observe,
+  };
 }
 
 function createDisabled(reason) {
@@ -904,10 +1102,11 @@ function createDisabled(reason) {
     enabled: false,
     start() {},
     stop() {},
+    async observe() {},
     async handleRequest(request, response, url) {
       if (!url.pathname.startsWith('/push/')) return false;
       if (url.pathname === '/push/config' && request.method === 'GET') {
-        return json(response, 200, { enabled: false, publicKey: null, reason });
+        return json(response, 200, { enabled: false, publicKey: null, reason, kinds: PUSH_KINDS });
       }
       return json(response, 503, { error: 'Push is not configured on this host.' });
     },

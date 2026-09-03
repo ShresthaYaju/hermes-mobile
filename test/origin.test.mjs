@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startProxy, startFakeHermes, rawRequest, rawUpgrade } from './helpers.mjs';
+import { startProxy, startFakeHermes, rawRequest, rawUpgrade, waitFor } from './helpers.mjs';
 
 const EVIL = 'https://evil.example';
 
@@ -38,7 +38,9 @@ test('the app’s own origin still upgrades', async (t) => {
 
   // What a browser sends when the page is served from this proxy.
   await rawUpgrade(proxy.port, '/api/ws', { Origin: `http://127.0.0.1:${proxy.port}` });
-  assert.equal(hermes.upgrades.length, 1, 'same-origin must still work');
+  // The gateway answers the phone's handshake before its own upstream
+  // connection to Hermes finishes, so this can lag a tick behind.
+  await waitFor(() => hermes.upgrades.length === 1);
 });
 
 test('a non-browser client with no Origin header still works', async (t) => {
@@ -52,7 +54,9 @@ test('a non-browser client with no Origin header still works', async (t) => {
   // A page cannot suppress Origin, so absence proves the caller is not a
   // browser. curl, native clients and this suite rely on it.
   await rawUpgrade(proxy.port, '/api/ws');
-  assert.equal(hermes.upgrades.length, 1);
+  // The gateway answers the phone's handshake before its own upstream
+  // connection to Hermes finishes, so this can lag a tick behind.
+  await waitFor(() => hermes.upgrades.length === 1);
 });
 
 test('cross-origin writes are refused before reaching Hermes', async (t) => {

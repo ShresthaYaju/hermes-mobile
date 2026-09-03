@@ -17,7 +17,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import webpush from 'web-push';
 import { startProxy, startFakeHermes, rawGet, rawRequest } from './helpers.mjs';
-import { createNotifications, isDeliverableEndpoint, guardedLookup } from '../notifications.mjs';
+import {
+  createNotifications,
+  isDeliverableEndpoint,
+  guardedLookup,
+  PUSH_KINDS,
+} from '../notifications.mjs';
 
 // Generated per run rather than committed: a checked-in private key is a
 // credential, even a useless one.
@@ -78,6 +83,7 @@ test('push config exposes only the public key', async (t) => {
   assert.equal(body.enabled, true);
   assert.equal(body.publicKey, VAPID.publicKey);
   assert.doesNotMatch(response.body, new RegExp(VAPID.privateKey.replace(/[-_]/g, '.')));
+  assert.deepEqual(body.kinds, PUSH_KINDS, 'the client needs the kind list to intersect against');
 });
 
 test('subscribe stores a subscription owner-only and unsubscribe removes it', async (t) => {
@@ -1275,8 +1281,13 @@ test('load re-validates stored subscriptions: unusable ones are dropped, unknown
   assert.equal(state.subscriptions[0].endpoint, 'https://fcm.googleapis.com/fcm/send/good');
   assert.deepEqual(
     Object.keys(state.subscriptions[0]).sort(),
-    ['endpoint', 'keys', 'owner'],
+    ['endpoint', 'keys', 'kinds', 'owner'],
     'a field this code never wrote must not survive a load',
+  );
+  assert.deepEqual(
+    state.subscriptions[0].kinds,
+    PUSH_KINDS,
+    'a legacy entry with no kinds field loads as every kind',
   );
 });
 
@@ -1293,4 +1304,471 @@ test('load repairs the state directory permissions even before anything is writt
 
   createNotifications({ hermesOrigin: 'http://127.0.0.1:1', sessionToken: '', stateDir });
   assert.equal(statSync(stateDir).mode & 0o777, 0o700);
+});
+
+// --- Per-device kind preferences ---------------------------------------------
+
+test('a subscription with no kinds field defaults to every kind', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/all-kinds';
+  const added = await rawRequest(proxy.port, 'POST', '/push/subscribe', {}, subscription(endpoint));
+  assert.equal(added.status, 204);
+
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = JSON.parse(readFileSync(statePath, 'utf8')).subscriptions[0];
+  assert.deepEqual(stored.kinds, PUSH_KINDS);
+});
+
+test('kinds are preserved on a re-POST that omits them', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/preserved';
+  await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    {},
+    { ...subscription(endpoint), kinds: ['error'] },
+  );
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = () => JSON.parse(readFileSync(statePath, 'utf8')).subscriptions[0];
+  assert.deepEqual(stored().kinds, ['error']);
+
+  // The client re-POSTs the same subscription -- rotated keys, no kinds -- on
+  // every settings visit to self-heal. That must not reset a choice already made.
+  await rawRequest(proxy.port, 'POST', '/push/subscribe', {}, subscription(endpoint));
+  assert.deepEqual(stored().kinds, ['error'], 'omitting kinds on re-POST must not reset it');
+});
+
+test('unknown kinds are dropped, known ones kept in PUSH_KINDS order', async (t) => {
+  const stateDir = tempStateDir(t);
+  const proxy = await startProxy({ env: withVapid(stateDir) });
+  t.after(() => proxy.stop());
+
+  const endpoint = 'https://fcm.googleapis.com/fcm/send/unknown-kinds';
+  await rawRequest(
+    proxy.port,
+    'POST',
+    '/push/subscribe',
+    {},
+    { ...subscription(endpoint), kinds: ['job', 'bogus', 'approval', 'also-bogus'] },
+  );
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = JSON.parse(readFileSync(statePath, 'utf8')).subscriptions[0];
+  assert.deepEqual(
+    stored.kinds,
+    ['approval', 'job'],
+    'unknown values are dropped and the rest reordered to PUSH_KINDS order',
+  );
+});
+
+test('an explicit empty kinds array is stored as empty and receives nothing', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([
+    { id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  const added = notifications.addSubscription({
+    ...subscription('https://push.example/none'),
+    kinds: [],
+  });
+  assert.equal(added.ok, true);
+
+  const statePath = join(stateDir, 'push-state.json');
+  const stored = JSON.parse(readFileSync(statePath, 'utf8')).subscriptions[0];
+  assert.deepEqual(stored.kinds, [], 'an explicit empty array is a real choice, not "absent"');
+
+  await notifications.poll(); // seeding
+  cron.set([
+    {
+      id: 'a',
+      name: 'Job A',
+      last_run_at: '2026-01-02T00:00:00Z',
+      last_status: 'error',
+      last_error: 'boom',
+    },
+  ]);
+  await notifications.poll();
+  assert.equal(sent.length, 0, 'a device subscribed to no kinds gets no job push either');
+});
+
+test('send() filters delivery by kind and by owner', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const cron = await fakeCron([
+    { id: 'a', name: 'Job A', last_run_at: '2026-01-01T00:00:00Z', last_status: 'ok' },
+  ]);
+  t.after(() => cron.stop());
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: cron.origin,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+
+  const jobOnly = 'https://push.example/job-only';
+  const replyOnly = 'https://push.example/reply-only';
+  const everything = 'https://push.example/everything';
+  notifications.addSubscription({ ...subscription(jobOnly), kinds: ['job'] }, 'alice@example.com');
+  notifications.addSubscription(
+    { ...subscription(replyOnly), kinds: ['reply'] },
+    'alice@example.com',
+  );
+  notifications.addSubscription(
+    { ...subscription(everything), kinds: [...PUSH_KINDS] },
+    'bob@example.com',
+  );
+
+  await notifications.poll(); // seeding
+
+  // A job failure is host-wide -- no owner filter -- so only kind decides.
+  cron.set([
+    {
+      id: 'a',
+      name: 'Job A',
+      last_run_at: '2026-01-02T00:00:00Z',
+      last_status: 'error',
+      last_error: 'boom',
+    },
+  ]);
+  await notifications.poll();
+  assert.deepEqual(
+    sent.map((s) => s.endpoint).sort(),
+    [everything, jobOnly].sort(),
+    'only subscriptions carrying the job kind receive a job push, regardless of owner',
+  );
+
+  sent.length = 0;
+
+  // A reply belongs to one session's owner: kind AND owner both gate it.
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'message.complete',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { status: 'ok', text: 'done' },
+  });
+  assert.deepEqual(
+    sent.map((s) => s.endpoint),
+    [replyOnly],
+    "only alice's reply-subscribed device gets it -- not her job-only device, not bob's (different owner)",
+  );
+});
+
+// --- observe(): session events -> pushes -------------------------------------
+
+test('observe(): approval.request always pushes, even when attached, and is owner-scoped', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: 'http://127.0.0.1:1',
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/owner'), 'alice@example.com');
+  notifications.addSubscription(subscription('https://push.example/stranger'), 'bob@example.com');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: true, // a stuck half-open socket must not silence this
+    type: 'approval.request',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { command: 'rm -rf /tmp/build', request_id: 'req-42' },
+  });
+
+  assert.equal(sent.length, 1, "only alice's device gets it, and attached does not suppress it");
+  assert.equal(sent[0].endpoint, 'https://push.example/owner');
+  assert.equal(sent[0].payload.title, 'Approval needed');
+  assert.match(sent[0].payload.body, /rm -rf \/tmp\/build/);
+  assert.equal(sent[0].payload.tag, 'approval-req-42');
+  assert.equal(sent[0].payload.url, '/#/now');
+});
+
+test('observe(): message.complete is skipped when attached, otherwise reply or error by status', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: 'http://127.0.0.1:1',
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'), 'alice@example.com');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: true,
+    type: 'message.complete',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { status: 'ok', text: 'All done here' },
+  });
+  assert.equal(sent.length, 0, 'a phone already looking at the chat is not pushed to');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'message.complete',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { status: 'interrupted', text: 'ignored' },
+  });
+  assert.equal(sent.length, 0, 'an interrupted turn is not a result worth surfacing');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'message.complete',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { status: 'ok', text: 'All done here' },
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].payload.title, 'Hermes replied');
+  assert.equal(sent[0].payload.body, 'All done here');
+  assert.equal(sent[0].payload.tag, 'reply-sess-1');
+  assert.equal(sent[0].payload.url, '/#/chat', 'no threadId known, so the generic chat url');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'message.complete',
+    sessionId: 'sess-2',
+    threadId: 'thread/with spaces',
+    payload: { status: 'ok', text: '' },
+  });
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].payload.body, 'Done', 'an empty reply text falls back to Done');
+  assert.equal(sent[1].payload.url, `/#/chat/${encodeURIComponent('thread/with spaces')}`);
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'message.complete',
+    sessionId: 'sess-3',
+    threadId: null,
+    payload: { status: 'error', text: 'the tool call failed' },
+  });
+  assert.equal(sent.length, 3);
+  assert.equal(sent[2].payload.title, 'Hermes hit an error');
+  assert.equal(sent[2].payload.body, 'the tool call failed');
+  assert.equal(sent[2].payload.tag, 'error-sess-3');
+});
+
+test('observe(): a plain error event is skipped when attached, pushed otherwise', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: 'http://127.0.0.1:1',
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'), 'alice@example.com');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: true,
+    type: 'error',
+    sessionId: 'sess-9',
+    threadId: 'thread-9',
+    payload: { message: 'connection reset' },
+  });
+  assert.equal(sent.length, 0);
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'error',
+    sessionId: 'sess-9',
+    threadId: 'thread-9',
+    payload: { message: 'connection reset' },
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].payload.title, 'Hermes hit an error');
+  assert.equal(sent[0].payload.body, 'connection reset');
+  assert.equal(sent[0].payload.tag, 'error-sess-9');
+  assert.equal(sent[0].payload.url, `/#/chat/${encodeURIComponent('thread-9')}`);
+});
+
+test('observe(): clarify.request always pushes, and unrecognised event types are ignored', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: 'http://127.0.0.1:1',
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'), 'alice@example.com');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: false,
+    type: 'session.started',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: {},
+  });
+  assert.equal(sent.length, 0, 'an event type this code does not recognise is ignored');
+
+  await notifications.observe({
+    login: 'alice@example.com',
+    attached: true,
+    type: 'clarify.request',
+    sessionId: 'sess-1',
+    threadId: null,
+    payload: { question: 'Which environment?', request_id: 'clarify-7' },
+  });
+  assert.equal(sent.length, 1, 'a clarifying question always pushes too, even attached');
+  assert.equal(sent[0].payload.title, 'Hermes has a question');
+  assert.equal(sent[0].payload.body, 'Which environment?');
+  assert.equal(sent[0].payload.tag, 'approval-clarify-7');
+  assert.equal(sent[0].payload.url, '/#/now');
+});
+
+test('observe() never throws, even given a malformed or empty event', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  const notifications = createNotifications({
+    hermesOrigin: 'http://127.0.0.1:1',
+    sessionToken: '',
+    stateDir,
+  });
+  await assert.doesNotReject(() => notifications.observe());
+  await assert.doesNotReject(() => notifications.observe({ type: 'approval.request' }));
+});
+
+test("createDisabled's observe() stub resolves immediately and does nothing", async (t) => {
+  const proxy = await startProxy(); // no VAPID keys -> push disabled
+  t.after(() => proxy.stop());
+  const config = await rawGet(proxy.port, '/push/config');
+  assert.equal(JSON.parse(config.body).enabled, false);
+  // No direct handle to the disabled notifications object from here, but the
+  // proxy staying up and answering normally through disabled push is the
+  // behavioural guarantee: createDisabled must not have thrown wiring observe.
+});
+
+// --- Backend reachability ------------------------------------------------------
+
+test('backend-down fires once after three consecutive failures, and recovery fires once', async (t) => {
+  const stateDir = tempStateDir(t);
+  process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY = VAPID.publicKey;
+  process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY = VAPID.privateKey;
+  t.after(() => {
+    delete process.env.HERMES_MOBILE_VAPID_PUBLIC_KEY;
+    delete process.env.HERMES_MOBILE_VAPID_PRIVATE_KEY;
+  });
+
+  let down = true;
+  const server = http.createServer((request, response) => {
+    if (down) {
+      response.writeHead(500);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify([]));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    server.close();
+    await once(server, 'close');
+  });
+
+  const { sent, deliver } = recordingDeliver();
+  const notifications = createNotifications({
+    hermesOrigin: `http://127.0.0.1:${server.address().port}`,
+    sessionToken: '',
+    stateDir,
+    deliver,
+  });
+  notifications.addSubscription(subscription('https://push.example/device'));
+
+  await notifications.poll();
+  await notifications.poll();
+  assert.equal(sent.length, 0, 'two consecutive failures is not yet a verdict');
+
+  await notifications.poll(); // the third
+  assert.equal(sent.length, 1, 'the third consecutive failure fires the unreachable push');
+  assert.equal(sent[0].payload.title, 'Hermes is unreachable');
+  assert.equal(sent[0].payload.tag, 'ops-backend');
+
+  await notifications.poll(); // still down
+  assert.equal(sent.length, 1, 'staying down must not repeat the push');
+
+  down = false;
+  await notifications.poll();
+  assert.equal(sent.length, 2, 'recovery fires once');
+  assert.equal(sent[1].payload.title, 'Hermes is back');
+  assert.equal(sent[1].payload.tag, 'ops-backend');
+
+  await notifications.poll();
+  assert.equal(sent.length, 2, 'staying up must not repeat the recovery push');
 });

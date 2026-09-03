@@ -4,7 +4,7 @@
 // pinned whatever shipped on the first visit, so an installed home-screen app
 // could never pick up a new build. Cache is the fallback, not the source.
 
-const CACHE = 'hermes-mobile-v5';
+const CACHE = 'hermes-mobile-v6';
 
 const ASSETS = [
   '/',

@@ -145,6 +145,17 @@ outcome `upgrade` rather than `write`. Its method surface is a superset of any
 REST write's, so it would be the one gap in "writes are rate limited and
 recorded" otherwise.
 
+The socket is not forwarded transparently. `gateway.mjs` holds one upstream
+connection to Hermes per allowlisted login and relays every phone of that
+login through it, rewriting request ids so two devices cannot collide. The
+upstream carries the loopback credential and the loopback `Origin`, never
+anything the phone sent; the phone's own headers stop at the handshake. Two
+consequences worth knowing: devices signed in as the same login see each
+other's session events (the client filters what it shows, but the frames do
+arrive), and an approval request that arrives while no phone is connected is
+kept in memory and replayed to the next phone of that login that connects.
+Nothing is replayed across logins.
+
 Push endpoints get two separate checks, not one, because checking only the
 literal host a caller supplied is not enough: that host is what a resolver
 turns into a connection at *send* time, on every failing cron tick, for as

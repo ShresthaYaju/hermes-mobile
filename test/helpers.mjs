@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { WebSocketServer } from 'ws';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -82,18 +83,47 @@ export async function startProxy({
   };
 }
 
-/** A stand-in for `hermes serve`, recording what the proxy forwards upstream. */
+/**
+ * A stand-in for `hermes serve`, recording what the proxy forwards upstream.
+ *
+ * The gateway keeps its upstream connection open for as long as the login has
+ * ever had a phone attached, so this now completes the JSON-RPC handshake for
+ * real rather than destroying the socket -- tests need to send events down it
+ * (`fake.sockets[0].send(...)`) and read what the gateway relayed up
+ * (`fake.frames`, or a socket's own `.messages`).
+ */
 export async function startFakeHermes() {
   const requests = [];
   const upgrades = [];
+  const sockets = [];
+  const frames = [];
   const server = http.createServer((request, response) => {
     requests.push({ url: request.url, headers: request.headers });
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     response.end(JSON.stringify({ upstream: true, url: request.url }));
   });
-  server.on('upgrade', (request, socket) => {
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request, socket, head) => {
     upgrades.push({ url: request.url, headers: request.headers });
-    socket.destroy();
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      ws.messages = [];
+      sockets.push(ws);
+      ws.on('message', (data, isBinary) => {
+        if (isBinary) return;
+        try {
+          const frame = JSON.parse(data.toString('utf8'));
+          frames.push(frame);
+          ws.messages.push(frame);
+        } catch {
+          // Not a test this helper needs to support -- the gateway's own
+          // frame parsing is exercised directly in gateway.test.mjs.
+        }
+      });
+      ws.on('close', () => {
+        const index = sockets.indexOf(ws);
+        if (index >= 0) sockets.splice(index, 1);
+      });
+    });
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -101,11 +131,32 @@ export async function startFakeHermes() {
     origin: `http://127.0.0.1:${server.address().port}`,
     requests,
     upgrades,
+    sockets,
+    frames,
     async stop() {
+      for (const ws of sockets.slice()) ws.terminate();
+      wss.close();
       server.close();
       await once(server, 'close');
     },
   };
+}
+
+/**
+ * Poll until `predicate()` is truthy. The gateway completes a phone's
+ * handshake before its upstream connection to Hermes finishes -- the two are
+ * independent, unlike the old transparent proxy.ws() forward where a client
+ * only ever saw its own 101 after the upstream's had already arrived -- so a
+ * test that wants to observe the upstream side can no longer assume it is
+ * already there the instant the phone-side await resolves.
+ */
+export async function waitFor(predicate, { timeout = 2000, interval = 10 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error('condition not met before timeout');
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
 }
 
 /** Raw request helper -- undici/fetch rejects some of the malformed paths we test. */

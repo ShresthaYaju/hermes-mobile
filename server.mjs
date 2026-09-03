@@ -4,6 +4,17 @@ import { extname, join, normalize } from 'node:path';
 import process from 'node:process';
 import httpProxy from 'http-proxy-3';
 import { createNotifications } from './notifications.mjs';
+import { createGateway } from './gateway.mjs';
+
+// This proxy forwards REST transparently, but not the JSON-RPC WebSocket.
+// Hermes routes each session's events (approval.request, message.complete,
+// error, ...) only to the transport that owns that session, and drops them
+// when it doesn't -- which is exactly what happens the moment a phone
+// backgrounds and its socket drops. So gateway.mjs owns one long-lived
+// upstream WebSocket to Hermes per tailnet login instead of forwarding the
+// phone's socket byte-for-byte: the upstream survives the phone going away,
+// which is what lets a missed approval or a finished reply become a push
+// notification instead of vanishing into a drop sink.
 
 // Node's defaults for these are not what a service managed by systemd wants:
 // an unhandled rejection only warns and keeps running, possibly half broken,
@@ -363,8 +374,8 @@ const restWriteRules = [
   { method: 'POST', pattern: /^\/api\/model\/set$/ },
 ];
 
-// The JSON-RPC gateway is a separate, already-working path with its own
-// credential handling in the upgrade handler.
+// The JSON-RPC gateway is a separate path handled entirely by gateway.mjs,
+// with its own credential handling in the upgrade handler below.
 const websocketPath = '/api/ws';
 
 // The allowlist matches url.pathname, which the WHATWG parser has normalized.
@@ -543,7 +554,6 @@ const mimeTypes = {
 
 const proxy = httpProxy.createProxyServer({
   target: hermesOrigin,
-  ws: true,
   // Hermes is deliberately loopback-only. Rewrite the upstream Host header so
   // its host-header and loopback-auth checks see the local origin, never the
   // public Tailnet name supplied by the mobile browser.
@@ -551,11 +561,13 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
-// http-proxy reuses this handler for both proxy.web() and proxy.ws(). On a
-// WebSocket failure the third argument is a net.Socket, which has no
-// writeHead/headersSent -- calling them there throws and takes the process
-// down, which is exactly what happens when a phone's reconnect loop hits a
-// restarting backend. Branch on the shape rather than assuming a response.
+// http-proxy reuses this handler for every proxy.web() failure. It used to
+// also fire for proxy.ws() with a raw net.Socket as the third argument --
+// calling writeHead on that throws and takes the process down -- but the
+// JSON-RPC socket no longer goes through http-proxy at all (see
+// gateway.mjs), so only a ServerResponse reaches this now. The shape check
+// stays as belt-and-braces against that assumption quietly stopping being
+// true.
 proxy.on('error', (error, request, target) => {
   console.error('Hermes proxy error:', error.message);
   if (!target) return;
@@ -575,13 +587,18 @@ proxy.on('error', (error, request, target) => {
 
 // What the internal hop is allowed to see of the client's request.
 // Forward-allowlisted rather than stripped by name: http-proxy copies every
-// header the client sent onto the outgoing request before proxyReq/proxyReqWs
-// fire, so a blocklist has to name each spoofable one -- X-Forwarded-*,
-// X-Real-IP, X-Original-URL, Tailscale-User-Name, Cookie, Authorization -- and
-// stays correct only for as long as nobody forgets one. This proxy uses none
-// of Cookie or Authorization itself, so neither belongs upstream either. A
+// header the client sent onto the outgoing request before proxyReq fires, so
+// a blocklist has to name each spoofable one -- X-Forwarded-*, X-Real-IP,
+// X-Original-URL, Tailscale-User-Name, Cookie, Authorization -- and stays
+// correct only for as long as nobody forgets one. This proxy uses none of
+// Cookie or Authorization itself, so neither belongs upstream either. A
 // forward-allowlist has the opposite failure mode: a header this file has
 // never heard of does not reach Hermes by default.
+//
+// No sec-websocket-* entries: this list now guards proxy.web() alone, which
+// never carries a handshake. The JSON-RPC upgrade is gateway.mjs's own
+// client connection and never forwards a single phone header (see
+// connectUpstream() there).
 const FORWARDED_REQUEST_HEADERS = new Set([
   'host', // already rewritten to the loopback target by changeOrigin
   'content-type',
@@ -594,10 +611,6 @@ const FORWARDED_REQUEST_HEADERS = new Set([
   'origin',
   'connection',
   'upgrade',
-  'sec-websocket-key',
-  'sec-websocket-version',
-  'sec-websocket-extensions',
-  'sec-websocket-protocol',
   'cache-control',
   'pragma',
   'if-none-match',
@@ -612,8 +625,8 @@ function stripUnlistedHeaders(proxyRequest) {
 }
 
 // Hermes authenticates REST calls with a header, the same shared loopback
-// credential the WebSocket upgrade uses. Add it on the internal hop only, so
-// the browser never receives it -- mirroring what proxyReqWs already does.
+// credential gateway.mjs's upstream connection uses. Add it on the internal
+// hop only, so the browser never receives it.
 proxy.on('proxyReq', (proxyRequest) => {
   stripUnlistedHeaders(proxyRequest);
   // Unconditionally, so that a client-supplied copy cannot survive when no
@@ -623,17 +636,6 @@ proxy.on('proxyReq', (proxyRequest) => {
   if (hermesSessionToken) {
     proxyRequest.setHeader('X-Hermes-Session-Token', hermesSessionToken);
   }
-});
-
-// Rewriting Origin to the loopback value satisfies Hermes's own DNS-rebinding
-// guard, but it also destroys the evidence that guard relies on -- so the
-// browser's real Origin MUST have been checked before we get here. See
-// isSameOrigin() and the upgrade handler; this rewrite is safe only because
-// of them.
-proxy.on('proxyReqWs', (proxyRequest) => {
-  stripUnlistedHeaders(proxyRequest);
-  proxyRequest.setHeader('origin', hermesOrigin);
-  proxyRequest.removeHeader('x-hermes-session-token');
 });
 
 // proxy.web() only ever runs for /api/*, so this is scoped by construction.
@@ -701,6 +703,14 @@ function parseRequestUrl(request) {
 }
 
 const notifications = createNotifications({ hermesOrigin, sessionToken: hermesSessionToken });
+
+// The gateway hands every session event to notifications.observe() so a
+// missed approval or a finished reply can become a push notification.
+const gateway = createGateway({
+  hermesOrigin,
+  sessionToken: hermesSessionToken,
+  observe: notifications.observe,
+});
 
 const server = http.createServer((request, response) => {
   const url = parseRequestUrl(request);
@@ -946,8 +956,8 @@ server.on('upgrade', (request, socket, head) => {
   // The socket is the highest-privilege event this proxy admits -- its
   // JSON-RPC method surface includes shell.exec -- and until now it was the
   // one path that reached the agent with no audit line and no write budget.
-  // Meter and log it exactly like a REST write, before proxy.ws hands the
-  // connection off.
+  // Meter and log it exactly like a REST write, before the gateway attaches
+  // this phone to the login's upstream.
   const entry = { login: who.login, method: 'GET', path: url.pathname };
   if (!withinWriteBudget(who.login)) {
     audit('rate-limited', entry);
@@ -956,11 +966,9 @@ server.on('upgrade', (request, socket, head) => {
     return;
   }
   audit('upgrade', entry);
-  url.searchParams.set('token', hermesSessionToken);
-  request.url = `${url.pathname}${url.search}`;
   upgradedSockets.add(socket);
   socket.on('close', () => upgradedSockets.delete(socket));
-  proxy.ws(request, socket, head);
+  gateway.accept(request, socket, head, who.login);
 });
 
 /**
@@ -1054,7 +1062,7 @@ server.listen(port, host, () => {
   console.log(`Proxying /api/* to ${hermesOrigin}`);
   if (notifications.enabled) {
     notifications.start();
-    console.log('Watching scheduled jobs for failures (push enabled)');
+    console.log('Push enabled: watching sessions, scheduled jobs and backend reachability');
   } else {
     console.log('Push notifications are off: set HERMES_MOBILE_VAPID_PUBLIC_KEY/PRIVATE_KEY');
   }
@@ -1069,6 +1077,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     // everything closed instead of waiting, with a hard fallback in case some
     // handle this file does not know about keeps the process alive anyway.
     notifications.stop();
+    gateway.close();
     server.close(() => process.exit(0));
     server.closeAllConnections?.(); // Node >=18.2
     for (const socket of upgradedSockets) socket.destroy();
