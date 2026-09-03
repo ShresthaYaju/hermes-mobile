@@ -6,6 +6,14 @@
 
 An installable mobile control surface for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — the same local agent you already talk to through Telegram, reachable from your phone over your own Tailscale tailnet and nowhere else.
 
+<p align="center">
+  <img src="docs/screenshots/now.png" width="196" alt="Now tab: gateway up, an empty Needs-you section, and recent scheduled runs with their outcomes">
+  <img src="docs/screenshots/work.png" width="196" alt="Work tab: scheduled jobs with schedule, next run, health, and Run now / Pause controls">
+  <img src="docs/screenshots/chat.png" width="196" alt="Chat tab: a new thread ready for a message">
+  <img src="docs/screenshots/config.png" width="196" alt="Config tab: current model, agent profiles, and push alert settings">
+</p>
+<p align="center"><sub>Now · Work · Chat · Config — shown with sample data, not a real setup</sub></p>
+
 > **This is a companion app, not a standalone one.** It does nothing without a
 > running `hermes serve` on the same host. If you do not run Hermes Agent, this
 > repository is not useful to you on its own. See
@@ -26,14 +34,6 @@ Five tabs:
 | **Config** | Profiles, push alerts, and what this app deliberately cannot reach |
 
 Tapping one of your own chats reopens it in the composer, with its history above the input; tapping any other thread or run opens a Claude-Code-style read-only transcript: tool calls as collapsed rows you expand for input and output.
-
-<p align="center">
-  <img src="docs/screenshots/now.png" width="196" alt="Now tab: gateway up, an empty Needs-you section, and recent scheduled runs with their outcomes">
-  <img src="docs/screenshots/work.png" width="196" alt="Work tab: scheduled jobs with schedule, next run, health, and Run now / Pause controls">
-  <img src="docs/screenshots/chat.png" width="196" alt="Chat tab: a new thread ready for a message">
-  <img src="docs/screenshots/config.png" width="196" alt="Config tab: current model, agent profiles, and push alert settings">
-</p>
-<p align="center"><sub>Now · Work · Chat · Config — shown with sample data, not a real setup</sub></p>
 
 [`docs/DESIGN-NOTES.md`](docs/DESIGN-NOTES.md) records the reasoning behind the design, including two architectural spikes that came back negative and changed it.
 
