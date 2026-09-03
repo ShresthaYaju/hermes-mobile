@@ -61,6 +61,38 @@ Hermes routes agent events to whichever transport last touched a session, with n
 
 ## Install
 
+One command, on the machine that runs Hermes Agent:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ShresthaYaju/hermes-mobile/main/install.sh | bash
+```
+
+It checks for Node 22+, Hermes and Tailscale, clones to `~/hermes-mobile`, writes the
+service env file, installs and starts the two user systemd units, and runs
+`tailscale serve`. It never uses `sudo`: the one step that sometimes needs it
+(`tailscale serve`, the first time) is printed for you to run instead. Then it prints
+the `https://` URL to open on your phone.
+
+This is a control surface for an agent with shell access, so read the script before
+piping it to a shell — it is 300 lines of plain bash, and reading it *is* the
+install guide:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ShresthaYaju/hermes-mobile/main/install.sh
+less install.sh
+bash install.sh
+```
+
+Flags: `--login`, `--email`, `--port`, `--dir`, `--no-push`, `--no-serve`,
+`--uninstall`. Re-running is the upgrade path — `git -C ~/hermes-mobile pull && ~/hermes-mobile/install.sh` —
+and never rotates a token or key already in the env file.
+
+On iPhone Safari, open the URL and use **Share → Add to Home Screen**. On Android Chrome,
+use **Install app**. Push notifications are offered under **Config** once it is installed.
+
+<details>
+<summary><strong>By hand</strong> — what the script does, if you would rather do each step yourself</summary>
+
 ```bash
 git clone https://github.com/ShresthaYaju/hermes-mobile.git ~/hermes-mobile
 cd ~/hermes-mobile
@@ -89,6 +121,7 @@ Install the service units and start them:
 cp systemd/hermes-mobile-*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-mobile-backend.service hermes-mobile-pwa.service
+loginctl enable-linger "$USER"   # keep them running after you log out
 tailscale serve --bg 4174
 ```
 
@@ -98,13 +131,10 @@ tailscale serve --bg 4174
 > `ExecStart` and `WorkingDirectory` to match, or systemd will fail with a bare
 > `status=203/EXEC`.
 
-Open the HTTPS URL shown by:
+Open the HTTPS URL shown by `tailscale serve status`. Push notifications need a VAPID
+keypair as well; see [Notifications](#notifications-optional).
 
-```bash
-tailscale serve status
-```
-
-On iPhone Safari, use **Share → Add to Home Screen**. On Android Chrome, use **Install app**. The app keeps a local visual transcript for page-refresh continuity; Hermes persists actual conversation state on the host.
+</details>
 
 ## Configuration
 
@@ -142,7 +172,7 @@ The phone is the only place you look, so it has to be told. With push configured
 | Host status | The proxy could not reach Hermes for three polls in a row, and once more when it can again. |
 | Scheduled jobs | A job failed. Jobs that deliver `local` write their error to a file on the host and tell nobody else. |
 
-Each device picks its own kinds under **Config**. Approvals, replies and errors go only to devices of the login whose session produced them; host status and job failures go to everyone subscribed. To turn it on, add a VAPID keypair to the service env file:
+Each device picks its own kinds under **Config**. Approvals, replies and errors go only to devices of the login whose session produced them; host status and job failures go to everyone subscribed. `install.sh` sets this up when your tailnet login is an email address (or when given `--email`). By hand, add a VAPID keypair to the service env file, with a contact address that is really yours:
 
 ```bash
 umask 077
@@ -162,6 +192,8 @@ systemctl --user status hermes-mobile-backend.service hermes-mobile-pwa.service
 tailscale serve status
 curl -fsS http://127.0.0.1:4174/healthz
 ```
+
+To upgrade, pull and re-run the installer; to remove the services, `~/hermes-mobile/install.sh --uninstall`.
 
 Every write that reaches the agent is written to stdout as a JSON audit line
 carrying the identity, method and path:
