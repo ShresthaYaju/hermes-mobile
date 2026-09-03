@@ -154,7 +154,11 @@ test('a first install from a checkout writes env, units, and brings the proxy up
   assert.match(calls, /^loginctl enable-linger tester$/m);
   assert.match(calls, new RegExp(`^tailscale serve --bg ${port}$`, 'm'));
   assert.doesNotMatch(calls, /^git /m);
-  assert.match(out, /https:\/\/box\.tail1234\.ts\.net/);
+  // The URL stands on a line of its own with the QR code under it: the code is
+  // version 3, 29 modules, 37 characters wide with its quiet zone.
+  assert.match(out, /^ {2}https:\/\/box\.tail1234\.ts\.net$/m);
+  assert.match(out, /^ {2}█{37}$/m, 'top of the QR code');
+  assert.match(out, /^ {2}[█▀▄ ]{37}$/m);
 });
 
 test('re-running keeps every existing value and just refreshes units', async (t) => {

@@ -34,6 +34,7 @@
     "install.sh",
     "server.mjs",
     "notifications.mjs",
+    "qr.mjs",
     "README.md",
     "LICENSE"
   ],
