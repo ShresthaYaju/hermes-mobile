@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startProxy, startFakeHermes, rawGet, rawRequest, rawUpgrade } from './helpers.mjs';
+import {
+  startProxy,
+  startFakeHermes,
+  rawGet,
+  rawRequest,
+  rawUpgrade,
+  waitFor,
+} from './helpers.mjs';
 
 test('serves the app shell with security headers', async (t) => {
   const proxy = await startProxy();
@@ -41,17 +48,25 @@ test('a malformed percent-escape is rejected and does not kill the server', asyn
   assert.equal(after.status, 200, 'server should still serve requests');
 });
 
-// Regression: http-proxy reuses the error handler for ws, where the third
-// argument is a Socket. Calling response.writeHead on it threw and exited the
-// process -- triggered by any reconnect against a down backend.
+// Regression: http-proxy used to reuse the error handler for ws, where the
+// third argument is a Socket. Calling response.writeHead on it threw and
+// exited the process -- triggered by any reconnect against a down backend.
+// The JSON-RPC path no longer goes through http-proxy at all (see
+// gateway.mjs), but the property being pinned is the same: a dead backend
+// must never take the proxy down with it.
 test('a WebSocket upgrade with the backend down does not kill the server', async (t) => {
-  // Port 1 is closed, so the proxy's connection attempt fails.
+  // Port 1 is closed, so the gateway's own upstream connection attempt fails.
   const proxy = await startProxy({ hermesOrigin: 'http://127.0.0.1:1' });
   t.after(() => proxy.stop());
 
   for (let i = 0; i < 3; i += 1) {
+    // The phone's handshake with this proxy completes regardless -- the
+    // gateway answers it directly and only discovers the backend is down
+    // afterward, at which point it closes the phone with 1012 rather than
+    // never having answered it. What matters here is that discovering that
+    // does not take the process with it.
     const result = await rawUpgrade(proxy.port, '/api/ws');
-    assert.notEqual(result.outcome, 'upgraded');
+    assert.equal(result.outcome, 'upgraded');
   }
 
   assert.equal(proxy.exited, false, 'server should have survived the failed upgrades');
@@ -273,7 +288,9 @@ test('the session token is injected on the upstream upgrade, never sent by the b
   });
 
   await rawUpgrade(proxy.port, '/api/ws');
-  assert.equal(hermes.upgrades.length, 1);
+  // The gateway answers the phone's handshake before its own upstream
+  // connection to Hermes finishes, so this can lag a tick behind.
+  await waitFor(() => hermes.upgrades.length === 1);
 
   const forwarded = hermes.upgrades[0];
   assert.match(forwarded.url, /token=secret-token/);

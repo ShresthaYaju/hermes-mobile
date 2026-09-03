@@ -14,8 +14,8 @@ short version below before opening a PR.
   service restart, and it keeps the whole thing readable. A PR that adds a
   bundler, TypeScript, or a UI framework will be declined unless it comes with
   an argument that outweighs losing that.
-- **Two runtime dependencies.** `http-proxy-3` and `web-push`. Adding a third
-  needs a reason; adding a transitive tree needs a very good one.
+- **Three runtime dependencies.** `http-proxy-3`, `ws` and `web-push`. Adding a
+  fourth needs a reason; adding a transitive tree needs a very good one.
 - **Security controls are load-bearing.** Anything touching `server.mjs`'s
   identity gate, same-origin check, REST allowlist, or the WebSocket upgrade
   path needs a test that fails without your change.

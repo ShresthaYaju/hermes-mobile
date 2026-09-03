@@ -44,7 +44,8 @@
   },
   "dependencies": {
     "http-proxy-3": "^1.23.3",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "prettier": "^3.9.6"

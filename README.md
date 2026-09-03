@@ -43,11 +43,15 @@ Phone browser / installed PWA
   └─ HTTPS over your Tailscale tailnet
        └─ tailscale serve → 127.0.0.1:4174 (this proxy)
             ├─ static PWA assets
-            ├─ /push/*  handled locally: VAPID config, subscriptions, cron-failure watcher
-            └─ /api/*   allowlisted proxy → 127.0.0.1:9119 (hermes serve)
-                 ├─ REST: sessions, cron, profiles, status
-                 └─ JSON-RPC over WebSocket: live chat, approvals
+            ├─ /push/*  handled locally: VAPID config, subscriptions, notification kinds
+            ├─ /api/*   allowlisted REST proxy → 127.0.0.1:9119 (hermes serve)
+            │            sessions, cron, profiles, status
+            └─ /api/ws  JSON-RPC over WebSocket: live chat, approvals
+                         the proxy holds one upstream socket per login and
+                         relays phones through it (see below)
 ```
+
+Hermes delivers a session's events — approval requests, the finished reply, errors — only to the WebSocket that owns the session, and drops them once that socket is gone. A phone's socket is gone the moment the screen locks. So the proxy does not forward the phone's WebSocket transparently: it owns the connection to Hermes itself, one per tailnet login, and relays the phone's JSON-RPC frames through it. That connection stays up when the phone leaves, which is what lets a missed approval or a finished reply become a push notification, and lets a phone that reconnects be handed the approvals it missed.
 
 Both app processes bind only to loopback. `tailscale serve` is the only network entry point; do **not** use `tailscale funnel` for this app.
 
@@ -128,7 +132,17 @@ repository.
 
 ## Notifications (optional)
 
-Scheduled jobs that deliver `local` write failures to a file on the host and tell nobody. To have the phone tell you instead, add a VAPID keypair to the service env file:
+The phone is the only place you look, so it has to be told. With push configured the proxy sends:
+
+| Kind | When |
+| --- | --- |
+| Approvals | Hermes is waiting for a yes or no (always, even while the app is open — a stuck socket must not silence the one alert that unblocks the agent). Tap → Now. |
+| Replies | A turn finished while no phone was connected. Tap → that thread. |
+| Errors | A turn failed while no phone was connected. |
+| Host status | The proxy could not reach Hermes for three polls in a row, and once more when it can again. |
+| Scheduled jobs | A job failed. Jobs that deliver `local` write their error to a file on the host and tell nobody else. |
+
+Each device picks its own kinds under **Config**. Approvals, replies and errors go only to devices of the login whose session produced them; host status and job failures go to everyone subscribed. To turn it on, add a VAPID keypair to the service env file:
 
 ```bash
 umask 077
@@ -229,5 +243,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) — particularly the two design rules tha
 
 [MIT](LICENSE).
 
-`web-push`, one of the two runtime dependencies, is MPL-2.0; see
+`web-push`, one of the three runtime dependencies, is MPL-2.0; see
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

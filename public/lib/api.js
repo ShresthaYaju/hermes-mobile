@@ -125,8 +125,12 @@ export const api = {
 
   // Local to this app rather than Hermes: push subscription management.
   pushConfig: (signal) => request('/push/config', { signal }),
-  subscribePush: (subscription) =>
-    request('/push/subscribe', { method: 'POST', body: subscription }),
+  // `kinds` is omitted (rather than sent as an empty array) when the caller
+  // has none to say: JSON.stringify drops an undefined property, and the
+  // server reads its absence as "leave this endpoint's existing choice
+  // alone" -- see notifications.mjs's sanitizeKinds().
+  subscribePush: (subscription, kinds) =>
+    request('/push/subscribe', { method: 'POST', body: { ...subscription, kinds } }),
   unsubscribePush: (endpoint) =>
     request('/push/unsubscribe', { method: 'POST', body: { endpoint } }),
 };

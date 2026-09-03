@@ -6,9 +6,11 @@ webfonts. Everything below is pulled from npm at install time.
 
 ## Runtime dependencies
 
-Two, deliberately.
+Three, deliberately.
 
-- **`http-proxy-3`** — MIT. The HTTP and WebSocket proxy.
+- **`http-proxy-3`** — MIT. The REST proxy.
+- **`ws`** — MIT. WebSocket framing for the session multiplexer, on both the
+  phone side and the Hermes side. No dependencies of its own.
 - **`web-push`** — **MPL-2.0**. VAPID signing and Web Push delivery. This is the
   one non-permissive license in the tree.
 
@@ -59,6 +61,7 @@ As locked by `package-lock.json`. Regenerate with `npm ls --all`.
 | `safe-buffer` | 5.2.1 | MIT |
 | `safer-buffer` | 2.1.2 | MIT |
 | `web-push` | 3.6.7 | MPL-2.0 |
+| `ws` | 8.21.3 | MIT |
 
 Every package above is MIT, ISC, BSD-3-Clause or Apache-2.0 except `web-push`,
 which is MPL-2.0 as described above. There is no GPL, AGPL or LGPL anywhere in

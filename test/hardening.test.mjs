@@ -14,7 +14,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startProxy, startFakeHermes, rawGet, rawRequest, rawUpgrade } from './helpers.mjs';
+import {
+  startProxy,
+  startFakeHermes,
+  rawGet,
+  rawRequest,
+  rawUpgrade,
+  waitFor,
+} from './helpers.mjs';
 import http from 'node:http';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
@@ -143,7 +150,10 @@ test('the JSON-RPC upgrade still arrives with the session token', async (t) => {
 
   await rawUpgrade(proxy.port, '/api/ws');
 
-  assert.equal(hermes.upgrades.length, 1, 'the real socket must still work');
+  // The gateway answers the phone's handshake before its own upstream
+  // connection to Hermes finishes connecting -- the two no longer share one
+  // round trip the way proxy.ws() made them.
+  await waitFor(() => hermes.upgrades.length === 1);
   assert.match(hermes.upgrades[0].url, /token=secret-token/);
 });
 
@@ -338,7 +348,9 @@ test('the socket still opens for a Host the allowlist vouches for', async (t) =>
 
   await rawUpgrade(proxy.port, '/api/ws', identified({ Host: 'hermes.tail1234.ts.net' }));
 
-  assert.equal(hermes.upgrades.length, 1, 'the real socket must still work');
+  // See the comment on the equivalent wait above: the gateway's own upstream
+  // connect lags a tick behind the phone-side handshake this awaited.
+  await waitFor(() => hermes.upgrades.length === 1);
   assert.match(hermes.upgrades[0].url, /token=secret-token/);
 });
 
@@ -546,7 +558,9 @@ test('a WebSocket upgrade spends the same write budget a REST write does', async
   });
 
   await rawUpgrade(proxy.port, '/api/ws', identified());
-  assert.equal(hermes.upgrades.length, 1, 'the first upgrade is within the budget');
+  // The gateway's own upstream connect lags a tick behind the phone-side
+  // handshake this awaited, unlike the old proxy.ws() forward.
+  await waitFor(() => hermes.upgrades.length === 1, { timeout: 2000 });
 
   // A script that reconnects in a loop is exactly what the budget exists to
   // bound, and the socket used to be exempt from it entirely.
@@ -608,7 +622,9 @@ test('the same allowlist applies to the WebSocket handshake', async (t) => {
     Authorization: 'Bearer forged',
   });
 
-  assert.equal(hermes.upgrades.length, 1, 'the handshake itself must still succeed');
+  // The gateway's own upstream connect lags a tick behind the phone-side
+  // handshake this awaited, unlike the old proxy.ws() forward.
+  await waitFor(() => hermes.upgrades.length === 1);
   const { headers } = hermes.upgrades[0];
   for (const name of [
     'x-original-url',

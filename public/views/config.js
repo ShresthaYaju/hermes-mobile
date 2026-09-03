@@ -2,7 +2,14 @@
 
 import { api } from '../lib/api.js';
 import { el, clear, spinner, errorState, relativeTime, toast, statusDot } from '../lib/ui.js';
-import { enablePush, disablePush, pushState } from '../lib/push.js';
+import {
+  enablePush,
+  disablePush,
+  pushState,
+  PUSH_KINDS,
+  getPushKinds,
+  setPushKinds,
+} from '../lib/push.js';
 import { navigate } from '../lib/router.js';
 
 export function configView() {
@@ -297,6 +304,7 @@ function renderNotifications(node) {
   const card = el('div', { class: 'card' });
   const status = el('div', { class: 'row-sub' });
   const button = el('button', { class: 'btn' }, '…');
+  const kinds = el('div', { class: 'kind-list' });
   card.append(
     el(
       'div',
@@ -304,13 +312,59 @@ function renderNotifications(node) {
       el('div', { class: 'row-main' }, el('div', { class: 'row-title' }, 'Push alerts'), status),
       button,
     ),
+    kinds,
     el(
       'p',
       { class: 'note' },
-      'Alerts when a scheduled job fails. Requires an installed app on iOS — add hermes-mobile to your home screen first.',
+      'Alerts for approvals, replies, errors, host status changes, and failed jobs — pick which below. Requires an installed app on iOS — add hermes-mobile to your home screen first.',
     ),
   );
   node.append(card);
+
+  // One toggle row per kind the host supports, folded under the alerts row
+  // rather than a picker: this device's choice, `current.kinds` the host's.
+  function renderKinds(current) {
+    clear(kinds);
+    if (!current.subscribed) return;
+    const enabled = new Set(getPushKinds());
+    const offered = current.kinds || PUSH_KINDS.map((kind) => kind.id);
+    for (const kind of PUSH_KINDS) {
+      if (!offered.includes(kind.id)) continue;
+      const toggle = el('input', {
+        type: 'checkbox',
+        class: 'switch',
+        'aria-label': kind.label,
+      });
+      toggle.checked = enabled.has(kind.id);
+      toggle.onchange = async () => {
+        toggle.disabled = true;
+        const next = new Set(getPushKinds());
+        if (toggle.checked) next.add(kind.id);
+        else next.delete(kind.id);
+        try {
+          await setPushKinds([...next]);
+        } catch (error) {
+          toggle.checked = !toggle.checked;
+          toast(error.message, 'error');
+        } finally {
+          toggle.disabled = false;
+        }
+      };
+      kinds.append(
+        el(
+          'div',
+          { class: 'row' },
+          el(
+            'div',
+            { class: 'row-main' },
+            el('div', { class: 'row-title' }, kind.label),
+            el('div', { class: 'row-sub' }, kind.hint),
+          ),
+          toggle,
+        ),
+      );
+    }
+  }
 
   const refresh = async () => {
     const current = await pushState();
@@ -333,6 +387,7 @@ function renderNotifications(node) {
         await refresh();
       }
     };
+    renderKinds(current);
   };
   refresh();
 }

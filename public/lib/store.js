@@ -1,9 +1,18 @@
 // Live state shared between the socket and the views.
 //
-// Scope note: the gateway delivers events only for sessions this app created
-// or activated. Telegram and cron work runs in other processes and is
-// invisible here -- those surfaces poll REST instead. So everything in this
-// store is about *our own* session.
+// Scope note: the gateway used to deliver events only for sessions this app
+// created or activated -- one phone, one upstream, one owner. The proxy now
+// terminates the phone's WebSocket itself and holds a single upstream
+// connection per *login*, so a second device signed in as the same person
+// shares it, and each side now receives event frames for sessions the OTHER
+// device is driving too (plus, on reconnect, a replay of any approval/clarify
+// frames that arrived while this device was away). Turn-progress events are
+// filtered to state.sessionId below so another device's activity never
+// bleeds into this one's status bar; approvals are kept for any session,
+// since an approval is something this person must answer regardless of which
+// device is driving (see the event listener for why). Telegram and cron work
+// runs in other processes and is still invisible here -- those surfaces poll
+// REST instead.
 
 import { socket } from './rpc.js';
 
@@ -256,13 +265,38 @@ socket.addEventListener('state', ({ detail }) => {
   }
 });
 
+// Turn-progress frames (as opposed to approval/clarify requests, handled
+// below) now arrive for other devices' sessions too -- see the scope note
+// above -- and must be dropped unless they belong to the session this app is
+// actually attached to. addApproval() dedupes replayed request_ids on its
+// own, so a frame the proxy replays after a reconnect is harmless either way.
+const PROGRESS_EVENT_TYPES = new Set([
+  'message.start',
+  'tool.start',
+  'tool.complete',
+  'status.update',
+  'message.complete',
+  'error',
+]);
+
 socket.addEventListener('event', ({ detail }) => {
   const { type, session_id: sessionId, payload = {} } = detail;
+  // chat.js's attach() sets state.sessionId (via update()) as soon as
+  // session.create/session.resume resolves, and always before its first
+  // prompt.submit -- so a progress event for our own turn is never dropped
+  // here for arriving "too early". A null state.sessionId means we are not
+  // attached to anything, so nothing at all is ours to show; the strict
+  // comparison below intentionally never matches sessionId to a null
+  // state.sessionId.
+  if (PROGRESS_EVENT_TYPES.has(type) && sessionId !== state.sessionId) return;
   switch (type) {
     // The live handle an approval answers to is the one the event arrived on,
     // not necessarily the chat view's current one -- a reconnect can swap
     // state.sessionId out from under a card still on screen. Stamping it here
     // is what lets now.js answer against the request's own session instead.
+    // Kept for ANY session, unlike the progress events above: an approval on
+    // a session the other device is driving is still something this person
+    // must answer.
     case 'approval.request':
       addApproval({ ...payload, session_id: sessionId });
       break;

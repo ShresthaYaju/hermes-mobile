@@ -11,7 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { startProxy, startFakeHermes, rawRequest, rawUpgrade } from './helpers.mjs';
+import { startProxy, startFakeHermes, rawRequest, rawUpgrade, waitFor } from './helpers.mjs';
 
 const OWNER = 'yaju@example.com';
 const STRANGER = 'someone-else@example.com';
@@ -101,7 +101,9 @@ test('an allowlisted identity may open the WebSocket', async (t) => {
 
   await rawUpgrade(proxy.port, '/api/ws', identified(OWNER));
 
-  assert.equal(hermes.upgrades.length, 1);
+  // The gateway answers the phone's handshake before its own upstream
+  // connection to Hermes finishes, so this can lag a tick behind.
+  await waitFor(() => hermes.upgrades.length === 1);
 });
 
 test('push endpoints are gated too', async (t) => {
