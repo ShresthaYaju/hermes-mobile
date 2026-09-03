@@ -128,7 +128,7 @@ repository.
 | `HERMES_MOBILE_ALLOW_PUBLIC_BIND` | off | `1` overrides the refusal to bind a non-loopback address. **Do not set this** unless you have put real authentication in front of the app; see [SECURITY.md](SECURITY.md). Note that the identity header is still refused off a non-loopback socket, so a fronting proxy has to run on this same host. |
 | `HERMES_MOBILE_VAPID_PUBLIC_KEY` | *(none)* | Web Push. Absent, push is off and Config says so. |
 | `HERMES_MOBILE_VAPID_PRIVATE_KEY` | *(none)* | Web Push. Keep it in the `0600` env file and nowhere else. |
-| `HERMES_MOBILE_VAPID_SUBJECT` | `mailto:hermes@localhost` | Web Push contact, e.g. `mailto:you@example.com`. The fallback is a placeholder; some push services want a real address, so set it if alerts do not arrive. |
+| `HERMES_MOBILE_VAPID_SUBJECT` | `mailto:hermes@localhost` | Web Push contact, e.g. `mailto:you@example.com`. The fallback is a placeholder and Apple's push service refuses it outright (every delivery to an iPhone answers 403), so set a real address before expecting alerts on iOS. |
 
 ## Notifications (optional)
 
